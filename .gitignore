@@ -1,4 +1,7 @@
 *.ini
+*~
+.venv/
+docs/build/
 *.bin
 *out_*/
 work/
