@@ -525,8 +525,10 @@ class riscv_register_dependency_chain_stream extends riscv_directed_instr_stream
     // chain_regs[(i+1) % N] as rd, so every consecutive pair has a RAW hazard.
     for (int chain = 0; chain < int'(num_of_chains); chain++) begin
       for (int d = 0; d < int'(chain_depth); d++) begin
+        // LUI and AUIPC are U-type (no rs1), so exclude them.
         riscv_instr instr = riscv_instr::get_rand_instr(
           .include_category({ARITHMETIC}),
+          .exclude_instr({LUI, AUIPC}),
           .exclude_group({RV32C, RV64C, RV32F, RV64F, RV32D, RV64D,
                           RV32B, RV64B}));
         `DV_CHECK_RANDOMIZE_WITH_FATAL(instr,
