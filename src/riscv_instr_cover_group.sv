@@ -1800,7 +1800,7 @@ class riscv_instr_cover_group;
     cp_aq    : coverpoint instr.aq;
     cp_rl    : coverpoint instr.rl;
     cp_trans : coverpoint instr.instr_name {
-      bins lr_then_sc = (LR_W [*1:$] => SC_W);
+      bins lr_then_sc = (LR_W [*1:32] => SC_W);
     }
   endgroup
 
@@ -1823,7 +1823,7 @@ class riscv_instr_cover_group;
     cp_aq    : coverpoint instr.aq;
     cp_rl    : coverpoint instr.rl;
     cp_trans : coverpoint instr.instr_name {
-      bins lr_then_sc = (LR_D [*1:$] => SC_D);
+      bins lr_then_sc = (LR_D [*1:32] => SC_D);
     }
   endgroup
 
