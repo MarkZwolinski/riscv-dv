@@ -72,12 +72,6 @@ class riscv_instr_cov_test extends uvm_test;
             end
             post_process_trace();
             if (trace["instr"] inside {"li", "ret", "la"}) continue;
-            if (uvm_is_match("amo*",trace["instr"]) ||
-                uvm_is_match("lr*" ,trace["instr"]) ||
-                uvm_is_match("sc*" ,trace["instr"])) begin
-              // TODO: Enable functional coverage for AMO test
-              continue;
-            end
             if (!sample()) begin
               if (report_illegal_instr) begin
                `uvm_error(`gfn, $sformatf("Found unexpected illegal instr: %0s [%0s]",
@@ -132,11 +126,21 @@ class riscv_instr_cov_test extends uvm_test;
         riscv_instr instr;
         instr = riscv_instr::get_instr(instr_name);
         if ((instr.group inside {RV32I, RV32M, RV32C, RV64I, RV64M, RV64C,
+                                 RV32A, RV64A,
                                  RV32F, RV64F, RV32D, RV64D, RV32B, RV64B,
                                  RV32ZBA, RV32ZBB, RV32ZBC, RV32ZBS,
                                  RV64ZBA, RV64ZBB, RV64ZBC, RV64ZBS}) &&
             (instr.group inside {supported_isa})) begin
           assign_trace_info_to_instr(instr);
+          // For AMO instructions, extract aq/rl bits from the encoded binary.
+          // Bits [26] = aq, [25] = rl per the RISC-V A-extension encoding.
+          if (instr.group inside {RV32A, RV64A}) begin
+            riscv_amo_instr amo_instr;
+            if ($cast(amo_instr, instr)) begin
+              amo_instr.aq = instr.binary[26];
+              amo_instr.rl = instr.binary[25];
+            end
+          end
           instr.pre_sample();
           instr_cg.sample(instr);
         end
@@ -178,6 +182,14 @@ class riscv_instr_cov_test extends uvm_test;
     foreach (instr_name[i]) begin
       if (instr_name[i] == ".") begin
         instr_name[i] = "_";
+      end
+    end
+    // Strip AMO ordering suffixes (_AQ, _RL) produced by the ISS trace normalisation above.
+    // e.g. AMOSWAP_W_AQ -> AMOSWAP_W  so the enum lookup succeeds.
+    if (instr_name.len() > 3) begin
+      string suffix = instr_name.substr(instr_name.len()-3, instr_name.len()-1);
+      if (suffix == "_AQ" || suffix == "_RL") begin
+        instr_name = instr_name.substr(0, instr_name.len()-4);
       end
     end
 

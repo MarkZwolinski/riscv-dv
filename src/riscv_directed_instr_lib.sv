@@ -482,3 +482,125 @@ class riscv_int_numeric_corner_stream extends riscv_directed_instr_stream;
   endfunction
 
 endclass : riscv_int_numeric_corner_stream
+
+// Stream that generates back-to-back RAW (Read-After-Write) dependency chains.
+// Each instruction's rd is the rs1 of the next, creating maximum pipeline hazard pressure.
+class riscv_register_dependency_chain_stream extends riscv_directed_instr_stream;
+
+  rand int unsigned chain_depth;
+  rand int unsigned num_of_chains;
+  rand riscv_reg_t  chain_regs[];
+
+  constraint chain_c {
+    solve chain_depth before num_of_chains;
+    solve num_of_chains before chain_regs;
+    chain_depth   inside {[3:10]};
+    num_of_chains inside {[2:4]};
+    chain_regs.size() == num_of_chains + 1;
+    unique {chain_regs};
+    foreach (chain_regs[i]) {
+      !(chain_regs[i] inside {cfg.reserved_regs, ZERO});
+    }
+  }
+
+  `uvm_object_utils(riscv_register_dependency_chain_stream)
+  `uvm_object_new
+
+  function void pre_randomize();
+    chain_regs = new[3]; // sized by constraint solve, default avoids null
+    super.pre_randomize();
+  endfunction
+
+  function void post_randomize();
+    // Initialise each chain register to a non-zero value so hazards are exercised
+    // on real data rather than constant zeros.
+    for (int c = 0; c < int'(num_of_chains + 1); c++) begin
+      riscv_pseudo_instr li_instr = new();
+      li_instr.pseudo_instr_name = LI;
+      li_instr.rd = chain_regs[c];
+      li_instr.imm_str = $sformatf("%0d", c + 1);
+      instr_list.push_back(li_instr);
+    end
+    // Generate chains: instruction i uses chain_regs[i % N] as rs1 and
+    // chain_regs[(i+1) % N] as rd, so every consecutive pair has a RAW hazard.
+    for (int chain = 0; chain < int'(num_of_chains); chain++) begin
+      for (int d = 0; d < int'(chain_depth); d++) begin
+        riscv_instr instr = riscv_instr::get_rand_instr(
+          .include_category({ARITHMETIC}),
+          .exclude_group({RV32C, RV64C, RV32F, RV64F, RV32D, RV64D,
+                          RV32B, RV64B}));
+        `DV_CHECK_RANDOMIZE_WITH_FATAL(instr,
+          rs1 == chain_regs[(chain + d)     % (num_of_chains + 1)];
+          rd  == chain_regs[(chain + d + 1) % (num_of_chains + 1)];
+          !(rd  inside {cfg.reserved_regs, ZERO});
+          !(rs1 inside {cfg.reserved_regs, ZERO});
+        )
+        instr_list.push_back(instr);
+      end
+    end
+    super.post_randomize();
+  endfunction
+
+endclass : riscv_register_dependency_chain_stream
+
+// Stream that generates back-to-back compressed (C-extension) instructions.
+// Useful for stressing decoders and coverage of RV32C/RV64C encodings.
+class riscv_compressed_stress_instr_stream extends riscv_rand_instr_stream;
+
+  rand int unsigned    num_of_c_instr;
+  riscv_instr_name_t   c_instr_names[$];
+
+  constraint instr_c {
+    num_of_c_instr inside {[20:50]};
+  }
+
+  `uvm_object_utils(riscv_compressed_stress_instr_stream)
+
+  function new(string name = "");
+    super.new(name);
+  endfunction
+
+  function void pre_randomize();
+    // Build the allowed compressed instruction list, excluding jumps out of the stream.
+    c_instr_names = {};
+    if (!cfg.disable_compressed_instr) begin
+      if (RV32C inside {supported_isa}) begin
+        foreach (riscv_instr::instr_group[RV32C][i]) begin
+          riscv_instr_name_t n = riscv_instr::instr_group[RV32C][i];
+          if (!(n inside {C_JR, C_JALR, C_J, C_JAL})) begin
+            c_instr_names.push_back(n);
+          end
+        end
+      end
+      if (RV64C inside {supported_isa}) begin
+        foreach (riscv_instr::instr_group[RV64C][i]) begin
+          riscv_instr_name_t n = riscv_instr::instr_group[RV64C][i];
+          if (!(n inside {C_JR, C_JALR, C_J, C_JAL})) begin
+            c_instr_names.push_back(n);
+          end
+        end
+      end
+    end
+    super.pre_randomize();
+  endfunction
+
+  function void post_randomize();
+    if (c_instr_names.size() == 0) return; // C extension not available
+    for (int i = 0; i < int'(num_of_c_instr); i++) begin
+      riscv_instr instr = riscv_instr::get_rand_instr(.include_instr(c_instr_names));
+      randomize_gpr(instr);
+      instr.atomic = 1'b1;
+      instr_list.push_back(instr);
+    end
+    if (instr_list.size() > 0) begin
+      instr_list[0].comment  = $sformatf("Start %0s", get_name());
+      instr_list[$].comment  = $sformatf("End %0s",   get_name());
+      foreach (instr_list[i]) instr_list[i].has_label = 1'b0;
+      if (label != "") begin
+        instr_list[0].label     = label;
+        instr_list[0].has_label = 1'b1;
+      end
+    end
+  endfunction
+
+endclass : riscv_compressed_stress_instr_stream

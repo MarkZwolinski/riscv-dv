@@ -15,3 +15,6 @@ riscv_dv.egg-info
 pygen/pygen_src/test/out/*
 !.gitkeep
 
+prompts.md
+plan.md
+summary.md

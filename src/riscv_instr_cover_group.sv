@@ -38,6 +38,16 @@
 `define SAMPLE_ZBB(cg, val) `SAMPLE_W_TYPE(cg, val, riscv_zbb_instr)
 `define SAMPLE_ZBC(cg, val) `SAMPLE_W_TYPE(cg, val, riscv_zbc_instr)
 `define SAMPLE_ZBS(cg, val) `SAMPLE_W_TYPE(cg, val, riscv_zbs_instr)
+`define SAMPLE_AMO(cg, val) `SAMPLE_W_TYPE(cg, val, riscv_amo_instr)
+
+`define AMO_INSTR_CG_BEGIN(INSTR_NAME) \
+  `INSTR_CG_BEGIN(INSTR_NAME, riscv_amo_instr) \
+    cp_rs1        : coverpoint instr.rs1; \
+    cp_rs2        : coverpoint instr.rs2; \
+    cp_rd         : coverpoint instr.rd;  \
+    cp_aq         : coverpoint instr.aq;  \
+    cp_rl         : coverpoint instr.rl;  \
+    `DV(cp_gpr_hazard : coverpoint instr.gpr_hazard;) \
 
 `define INSTR_CG_BEGIN(INSTR_NAME, INSTR_CLASS = riscv_instr) \
   covergroup ``INSTR_NAME``_cg with function sample(INSTR_CLASS instr);
@@ -1770,6 +1780,69 @@ class riscv_instr_cover_group;
     }
   endgroup
 
+  ///////////// RV32A AMO instruction covergroups //////////////
+  `AMO_INSTR_CG_BEGIN(amoswap_w) `CG_END
+  `AMO_INSTR_CG_BEGIN(amoadd_w)  `CG_END
+  `AMO_INSTR_CG_BEGIN(amoand_w)  `CG_END
+  `AMO_INSTR_CG_BEGIN(amoor_w)   `CG_END
+  `AMO_INSTR_CG_BEGIN(amoxor_w)  `CG_END
+  `AMO_INSTR_CG_BEGIN(amomin_w)  `CG_END
+  `AMO_INSTR_CG_BEGIN(amomax_w)  `CG_END
+  `AMO_INSTR_CG_BEGIN(amominu_w) `CG_END
+  `AMO_INSTR_CG_BEGIN(amomaxu_w) `CG_END
+
+  // LR/SC pairing: tracks LR_W followed (eventually) by SC_W
+  covergroup lr_sc_pair_cg with function sample(riscv_amo_instr instr);
+    cp_instr : coverpoint instr.instr_name {
+      bins lr_w = {LR_W};
+      bins sc_w = {SC_W};
+    }
+    cp_aq    : coverpoint instr.aq;
+    cp_rl    : coverpoint instr.rl;
+    cp_trans : coverpoint instr.instr_name {
+      bins lr_then_sc = (LR_W [*1:$] => SC_W);
+    }
+  endgroup
+
+  ///////////// RV64A AMO instruction covergroups //////////////
+  `AMO_INSTR_CG_BEGIN(amoswap_d) `CG_END
+  `AMO_INSTR_CG_BEGIN(amoadd_d)  `CG_END
+  `AMO_INSTR_CG_BEGIN(amoand_d)  `CG_END
+  `AMO_INSTR_CG_BEGIN(amoor_d)   `CG_END
+  `AMO_INSTR_CG_BEGIN(amoxor_d)  `CG_END
+  `AMO_INSTR_CG_BEGIN(amomin_d)  `CG_END
+  `AMO_INSTR_CG_BEGIN(amomax_d)  `CG_END
+  `AMO_INSTR_CG_BEGIN(amominu_d) `CG_END
+  `AMO_INSTR_CG_BEGIN(amomaxu_d) `CG_END
+
+  covergroup lr_d_sc_d_pair_cg with function sample(riscv_amo_instr instr);
+    cp_instr : coverpoint instr.instr_name {
+      bins lr_d = {LR_D};
+      bins sc_d = {SC_D};
+    }
+    cp_aq    : coverpoint instr.aq;
+    cp_rl    : coverpoint instr.rl;
+    cp_trans : coverpoint instr.instr_name {
+      bins lr_then_sc = (LR_D [*1:$] => SC_D);
+    }
+  endgroup
+
+  ///////////// Targeted instruction transition covergroups //////////////
+  // Load-to-use: a LOAD whose result is immediately consumed by an arithmetic op
+  covergroup load_to_use_cg with function sample(bit hit);
+    cp_ltu : coverpoint hit { bins detected = {1}; }
+  endgroup
+
+  // Branch-to-branch: two consecutive branch instructions (BHT pressure pattern)
+  covergroup branch_to_branch_cg with function sample(bit hit);
+    cp_bb : coverpoint hit { bins detected = {1}; }
+  endgroup
+
+  // CSR-to-arithmetic: CSR read result immediately used by an arithmetic op
+  covergroup csr_to_arith_cg with function sample(bit hit);
+    cp_ca : coverpoint hit { bins detected = {1}; }
+  endgroup
+
   `VECTOR_INCLUDE("riscv_instr_cover_group_inc_cg_add.sv")
 
   function new(riscv_instr_gen_config cfg);
@@ -1860,6 +1933,9 @@ class riscv_instr_cover_group;
     if (!compliance_mode) begin
       // instr_trans_cg = new();
       branch_hit_history_cg = new();
+      load_to_use_cg    = new();
+      branch_to_branch_cg = new();
+      csr_to_arith_cg   = new();
       rv32i_misc_cg = new();
       opcode_cg = new();
       // TODO: Enable WFI covergroup. It's currently disabled because OVPSIM will stop program
@@ -2142,6 +2218,32 @@ class riscv_instr_cover_group;
       fslw_cg         = new();
       fsrw_cg         = new();
       fsriw_cg        = new();
+    `CG_SELECTOR_END
+
+    `CG_SELECTOR_BEGIN(RV32A)
+      amoswap_w_cg = new();
+      amoadd_w_cg  = new();
+      amoand_w_cg  = new();
+      amoor_w_cg   = new();
+      amoxor_w_cg  = new();
+      amomin_w_cg  = new();
+      amomax_w_cg  = new();
+      amominu_w_cg = new();
+      amomaxu_w_cg = new();
+      if (!compliance_mode) lr_sc_pair_cg = new();
+    `CG_SELECTOR_END
+
+    `CG_SELECTOR_BEGIN(RV64A)
+      amoswap_d_cg = new();
+      amoadd_d_cg  = new();
+      amoand_d_cg  = new();
+      amoor_d_cg   = new();
+      amoxor_d_cg  = new();
+      amomin_d_cg  = new();
+      amomax_d_cg  = new();
+      amominu_d_cg = new();
+      amomaxu_d_cg = new();
+      if (!compliance_mode) lr_d_sc_d_pair_cg = new();
     `CG_SELECTOR_END
 
     // Ignore the exception which cannot be covered when running with ISS
@@ -2462,6 +2564,28 @@ class riscv_instr_cover_group;
       FSLW         : `SAMPLE_B(fslw_cg, instr)
       FSRW         : `SAMPLE_B(fsrw_cg, instr)
       FSRIW        : `SAMPLE_B(fsriw_cg, instr)
+      // RV32A
+      AMOSWAP_W  : `SAMPLE_AMO(amoswap_w_cg, instr)
+      AMOADD_W   : `SAMPLE_AMO(amoadd_w_cg,  instr)
+      AMOAND_W   : `SAMPLE_AMO(amoand_w_cg,  instr)
+      AMOOR_W    : `SAMPLE_AMO(amoor_w_cg,   instr)
+      AMOXOR_W   : `SAMPLE_AMO(amoxor_w_cg,  instr)
+      AMOMIN_W   : `SAMPLE_AMO(amomin_w_cg,  instr)
+      AMOMAX_W   : `SAMPLE_AMO(amomax_w_cg,  instr)
+      AMOMINU_W  : `SAMPLE_AMO(amominu_w_cg, instr)
+      AMOMAXU_W  : `SAMPLE_AMO(amomaxu_w_cg, instr)
+      LR_W, SC_W : if (!compliance_mode) `SAMPLE_AMO(lr_sc_pair_cg, instr)
+      // RV64A
+      AMOSWAP_D  : `SAMPLE_AMO(amoswap_d_cg, instr)
+      AMOADD_D   : `SAMPLE_AMO(amoadd_d_cg,  instr)
+      AMOAND_D   : `SAMPLE_AMO(amoand_d_cg,  instr)
+      AMOOR_D    : `SAMPLE_AMO(amoor_d_cg,   instr)
+      AMOXOR_D   : `SAMPLE_AMO(amoxor_d_cg,  instr)
+      AMOMIN_D   : `SAMPLE_AMO(amomin_d_cg,  instr)
+      AMOMAX_D   : `SAMPLE_AMO(amomax_d_cg,  instr)
+      AMOMINU_D  : `SAMPLE_AMO(amominu_d_cg, instr)
+      AMOMAXU_D  : `SAMPLE_AMO(amomaxu_d_cg, instr)
+      LR_D, SC_D : if (!compliance_mode) `SAMPLE_AMO(lr_d_sc_d_pair_cg, instr)
       `VECTOR_INCLUDE("riscv_instr_cover_group_inc_cg_sample.sv")
       default: begin
         if (instr.group == RV32I) begin
@@ -2508,6 +2632,19 @@ class riscv_instr_cover_group;
     if (instr_cnt > 1) begin
       if (!compliance_mode) begin
         //instr_trans_cg.sample();
+        if ((pre_instr.category == LOAD) &&
+            (instr.gpr_hazard == RAW_HAZARD) &&
+            (instr.category inside {ARITHMETIC, LOGICAL, SHIFT, COMPARE})) begin
+          `SAMPLE(load_to_use_cg, 1'b1)
+        end
+        if ((pre_instr.category == BRANCH) && (instr.category == BRANCH)) begin
+          `SAMPLE(branch_to_branch_cg, 1'b1)
+        end
+        if ((pre_instr.category == CSR) &&
+            (instr.gpr_hazard == RAW_HAZARD) &&
+            (instr.category inside {ARITHMETIC, LOGICAL, SHIFT})) begin
+          `SAMPLE(csr_to_arith_cg, 1'b1)
+        end
       end
     end
    `VECTOR_INCLUDE("riscv_instr_cover_group_inc_sample.sv")
@@ -2543,6 +2680,7 @@ class riscv_instr_cover_group;
         instr = riscv_instr::create_instr(instr_name);
         if ((instr.group inside {supported_isa}) &&
             (instr.group inside {RV32I, RV32M, RV64M, RV64I, RV32C, RV64C,
+                                 RV32A, RV64A,
                                  RVV, RV64B, RV32B,
                                  RV32ZBA, RV32ZBB, RV32ZBC, RV32ZBS,
                                  RV64ZBA, RV64ZBB, RV64ZBC, RV64ZBS})) begin
