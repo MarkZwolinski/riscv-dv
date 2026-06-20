@@ -1,0 +1,33 @@
+diff --git a/vendor/google_riscv-dv/cov.py b/vendor/google_riscv-dv/cov.py
+index b9f6983e..ad6cdce4 100644
+--- a/vendor/google_riscv-dv/cov.py
++++ b/vendor/google_riscv-dv/cov.py
+@@ -70,12 +70,12 @@ def sim_cov(out, cfg, cwd, opts_vec, opts_cov, trace_log):
+       cwd                 : Filesystem path to RISCV-DV repo
+       opts_vec            : Vector options
+       opts_cov            : Coverage options
+-      trace_log           : A file containing the list of trace csv files, one file per line
++      trace_log           : Path to a file listing trace CSV paths (one per line)
+     """
+     # Convert key dictionary to argv variable
+     argv = SimpleNamespace(**cfg)
+     with open(trace_log, "r") as f:
+-        csv_list = f.readlines()
++        csv_list = [line.rstrip() for line in f if line.strip()]
+     logging.info(
+         "Collecting functional coverage from {} trace CSV".format(len(csv_list)))
+     test_name = "riscv_instr_cov_test"
+@@ -207,7 +207,12 @@ def collect_cov(out, cfg, cwd):
+         if argv.simulator != "pyflow":
+             build_cov(out, cfg, cwd, opts_vec, opts_cov)
+         # Simulation the coverage collection
+-        sim_cov(out, cfg, cwd, opts_vec, opts_cov, trace_log)
++        # Write CSV paths to a separate list file for the cov test
++        csv_trace_log = ("{}/{}_csv_trace_log".format(out, argv.iss))
++        with open(csv_trace_log, "w") as f:
++            for csv_path in csv_list:
++                f.write(csv_path + "\n")
++        sim_cov(out, cfg, cwd, opts_vec, opts_cov, csv_trace_log)
+ 
+ 
+ def setup_parser():

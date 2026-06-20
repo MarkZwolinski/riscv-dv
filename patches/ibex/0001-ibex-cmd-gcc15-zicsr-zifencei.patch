@@ -1,0 +1,13 @@
+diff --git a/dv/uvm/core_ibex/scripts/ibex_cmd.py b/dv/uvm/core_ibex/scripts/ibex_cmd.py
+index 0d8c5346..90c4a288 100644
+--- a/dv/uvm/core_ibex/scripts/ibex_cmd.py
++++ b/dv/uvm/core_ibex/scripts/ibex_cmd.py
+@@ -113,7 +113,7 @@ def get_isas_for_config(cfg: Config) -> Tuple[str, str]:
+         raise ValueError(f'Unknown RV32B value ({cfg.rv32b}) in config YAML')
+ 
+     has_bitmanip = cfg.rv32b != 'ibex_pkg::RV32BNone'
+-    toolchain_isa = base_isa + ('b' if has_bitmanip else '')
++    toolchain_isa = base_isa + ('b' if has_bitmanip else '') + '_zicsr_zifencei'
+ 
+     return (toolchain_isa, '_'.join([base_isa] + bitmanip_isa))
+ 
