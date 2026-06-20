@@ -1,0 +1,54 @@
+From 21b3e91308249683b1aefa5d1492f57673d8f8b7 Mon Sep 17 00:00:00 2001
+From: Mark <mz1@localhost.localdomain>
+Date: Sat, 20 Jun 2026 16:39:46 +0100
+Subject: [PATCH] [dv] Wire RV32ZC parameter through testbench hierarchy
+
+IBEX_CFG_RV32ZC was being generated correctly by ibex_config.py
+(e.g. +define+IBEX_CFG_RV32ZC=ibex_pkg::RV32Zca for the small config)
+but core_ibex_tb_top.sv never consumed it. ibex_top_tracing therefore
+always received its default RV32ZC=RV32ZcaZcbZcmp regardless of config,
+causing the Zcb compressed extension to be active even for configs like
+small that specify RV32Zca. This meant Zcb-only instructions (e.g.
+c.mul) were silently executed by the DUT while spike correctly raised
+an illegal-instruction exception, causing spurious cosim failures in
+riscv_illegal_instr_test.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ dv/uvm/core_ibex/tb/core_ibex_tb_top.sv | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/dv/uvm/core_ibex/tb/core_ibex_tb_top.sv b/dv/uvm/core_ibex/tb/core_ibex_tb_top.sv
+index 270ddac0..caf792c9 100644
+--- a/dv/uvm/core_ibex/tb/core_ibex_tb_top.sv
++++ b/dv/uvm/core_ibex/tb/core_ibex_tb_top.sv
+@@ -52,6 +52,10 @@ module core_ibex_tb_top;
+     `define IBEX_CFG_RegFile ibex_pkg::RegFileFF
+   `endif
+ 
++  `ifndef IBEX_CFG_RV32ZC
++    `define IBEX_CFG_RV32ZC ibex_pkg::RV32ZcaZcbZcmp
++  `endif
++
+   // Ibex Parameters
+   parameter bit          PMPEnable        = 1'b0;
+   parameter int unsigned PMPGranularity   = 0;
+@@ -62,6 +66,7 @@ module core_ibex_tb_top;
+   parameter ibex_pkg::rv32m_e RV32M       = `IBEX_CFG_RV32M;
+   parameter ibex_pkg::rv32b_e RV32B       = `IBEX_CFG_RV32B;
+   parameter ibex_pkg::regfile_e RegFile   = `IBEX_CFG_RegFile;
++  parameter ibex_pkg::rv32zc_e RV32ZC     = `IBEX_CFG_RV32ZC;
+   parameter bit BranchTargetALU           = 1'b0;
+   parameter bit WritebackStage            = 1'b0;
+   parameter bit ICache                    = 1'b0;
+@@ -104,6 +109,7 @@ module core_ibex_tb_top;
+     .RV32M                (RV32M               ),
+     .RV32B                (RV32B               ),
+     .RegFile              (RegFile             ),
++    .RV32ZC               (RV32ZC              ),
+     .BranchTargetALU      (BranchTargetALU     ),
+     .WritebackStage       (WritebackStage      ),
+     .ICache               (ICache              ),
+-- 
+2.52.0
+
