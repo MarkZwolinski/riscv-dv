@@ -1,26 +1,38 @@
 #!/usr/bin/env python3
 """
-Coverage-Directed Generation (CDG) proof of concept.
+Coverage-Directed Generation (CDG).
 
-Demonstrates a feedback loop between RTL coverage and test selection.
-Three strategies are compared:
-  - Random: pick a test type at random each iteration
-  - Greedy: always pick the test type with highest expected marginal gain
-  - UCB:    Upper Confidence Bound bandit — balance exploitation vs exploration
+Two backends:
 
-The "simulation oracle" uses pre-collected per-seed VDB coverage data, so the
-loop runs in seconds. To use with a real simulator, replace CoverageOracle with
-a class that runs make COV=1 and calls urg to extract the coverage delta.
+  Oracle mode  (default): uses pre-collected per-seed VDB coverage data as a
+                lookup table, so the loop runs in seconds. Good for strategy
+                comparison and parameter tuning.
+
+  Real mode (--real):    drives actual VCS simulations via the ibex make flow.
+                         run_test() calls `make SIMULATOR=vcs COV=1 TEST=<type>
+                         SEED=<seed> GOAL=all`, then extracts per-test coverage
+                         from the shared VDB with urg. Build the oracle DB first
+                         with --build-db so the real run can reuse the block
+                         layout and expected-gain priors.
+
+Three selection strategies:
+  Random  — pick a test type uniformly at random
+  Greedy  — always pick the type with highest expected marginal gain
+  UCB     — Upper Confidence Bound bandit (exploit vs explore); best without a prior
 
 Usage:
-    # Build coverage database from existing VDB first:
-    python3 coverage_directed_gen.py --build-db --vdb <path/to/merged.vdb>
+    # Build coverage database from an existing regression VDB:
+    python3 coverage_directed_gen.py --build-db --vdb <path/to/test.vdb>
 
-    # Then run the CDG loop:
+    # Run CDG loop in oracle mode (fast, uses pre-collected data):
     python3 coverage_directed_gen.py --db /tmp/seed_coverage.json --iters 60
 
-    # Run a specific strategy only:
-    python3 coverage_directed_gen.py --db /tmp/seed_coverage.json --strategy ucb
+    # Run CDG loop with REAL VCS simulations (requires ibex build, ~3 min/iter):
+    python3 coverage_directed_gen.py --real --db /tmp/seed_coverage.json \\
+        --strategy greedy --iters 13
+
+    # Real mode without a prior (UCB explores on its own):
+    python3 coverage_directed_gen.py --real --strategy ucb --iters 20
 """
 
 import argparse
@@ -30,6 +42,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from collections import defaultdict
 
 import numpy as np
@@ -183,6 +196,210 @@ class CoverageOracle:
 
 
 # ---------------------------------------------------------------------------
+# Real simulator oracle: drives VCS via the ibex make flow
+# ---------------------------------------------------------------------------
+
+class RealSimOracle:
+    """
+    Coverage oracle that runs actual VCS simulations via the ibex make flow.
+
+    Each run_test() call:
+      1. Picks a fresh seed (never in the pre-existing VDB).
+      2. Runs: make SIMULATOR=vcs ISS=spike IBEX_CONFIG=small COV=1 GOAL=all
+                   TEST=<type> SEED=<seed> ITERATIONS=1
+         Coverage is appended to the shared VDB with -cm_name test_<type>_<seed>.
+      3. Extracts per-test branch coverage from that VDB entry using urg.
+      4. Returns (seed, coverage_vector).
+
+    For expected_gain_per_type(), delegates to a CoverageOracle prior when one
+    is provided (historical data gives accurate gain estimates without running
+    simulations). Without a prior, falls back to running means of observed gains.
+
+    Arguments
+    ---------
+    ibex_dir       Path to /opt/ibex/dv/uvm/core_ibex (where Makefile lives).
+    riscvdv_root   RISCV_DV_ROOT exported to make (path to this repo).
+    pkg_config_path  PKG_CONFIG_PATH for spike-lowrisc; empty string to inherit.
+    all_blocks, block_idx, M_tot, test_types
+                   Coverage schema shared with the strategy classes. Typically
+                   copied from a CoverageOracle loaded from --db.
+    prior          Optional CoverageOracle used only for expected_gain_per_type().
+    """
+
+    _DEFAULT_IBEX   = '/opt/ibex/dv/uvm/core_ibex'
+    _DEFAULT_DV     = '/home/mz1/riscv-dv'
+    _DEFAULT_PKG    = '/opt/spike-lowrisc/install/lib/pkgconfig'
+    _SEED_START     = 2_000_000   # fresh seeds stay above existing regression range
+    _TIMEOUT_S      = 600         # hard per-test wall-clock cap
+
+    def __init__(self, ibex_dir, riscvdv_root, pkg_config_path,
+                 all_blocks, block_idx, M_tot, test_types, prior=None):
+        self.ibex_dir        = ibex_dir
+        self.riscvdv_root    = riscvdv_root
+        self.pkg_config_path = pkg_config_path
+        self.all_blocks      = all_blocks
+        self.n_blocks        = len(all_blocks)
+        self.block_idx       = block_idx
+        self.M_tot           = M_tot
+        self.test_types      = test_types
+        self.prior           = prior
+
+        # For print_results / convergence_summary compatibility
+        self.seeds = []
+        if prior is not None:
+            self.ceiling       = prior.ceiling
+            self.ceiling_score = prior.ceiling_score
+        else:
+            self.ceiling       = np.zeros(self.n_blocks)
+            self.ceiling_score = 0.0
+
+        self.vdb_path   = os.path.join(ibex_dir,
+                                       'out/run/coverage/shared_cov/test.vdb')
+        self.type_obs   = defaultdict(list)    # observed cov vectors per type
+        self._seed_iter = self._fresh_seeds()
+
+    # ------------------------------------------------------------------
+    # Seed management
+
+    def _fresh_seeds(self):
+        """Yield integer seeds that are not already in the VDB."""
+        existing = self._existing_seeds_in_vdb()
+        seed = self._SEED_START
+        while True:
+            if seed not in existing:
+                yield seed
+            seed += 1
+
+    def _existing_seeds_in_vdb(self):
+        if not os.path.exists(self.vdb_path):
+            return set()
+        out = subprocess.run(
+            ['urg', '-dir', self.vdb_path, '-show', 'availabletests'],
+            capture_output=True, text=True).stdout
+        seeds = set()
+        for line in out.splitlines():
+            m = re.search(r'_(\d+)\s*$', line.strip())
+            if m:
+                seeds.add(int(m.group(1)))
+        return seeds
+
+    # ------------------------------------------------------------------
+    # Core oracle interface
+
+    def _block_score(self, cov_vec):
+        denom = np.where(self.M_tot > 0, self.M_tot, 1.0)
+        return float((cov_vec / denom).mean())
+
+    def marginal_gain(self, current_cov, new_cov_vec):
+        merged = np.maximum(current_cov, new_cov_vec)
+        return self._block_score(merged) - self._block_score(current_cov)
+
+    def run_test(self, test_type, rng):
+        """Run one seed of test_type through VCS and return (seed, cov_vec)."""
+        seed = next(self._seed_iter)
+        self.seeds.append(f"test_{test_type}_{seed}")
+
+        env = {**os.environ, 'RISCV_DV_ROOT': self.riscvdv_root}
+        if self.pkg_config_path:
+            env['PKG_CONFIG_PATH'] = self.pkg_config_path
+
+        print(f"  [{test_type}] seed={seed}  running VCS...")
+        t0 = time.time()
+        try:
+            proc = subprocess.run(
+                ['make', '--no-print-directory',
+                 'SIMULATOR=vcs', 'ISS=spike', 'IBEX_CONFIG=small',
+                 'COV=1', 'GOAL=all',
+                 f'TEST={test_type}', f'SEED={seed}', 'ITERATIONS=1'],
+                cwd=self.ibex_dir, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=self._TIMEOUT_S)
+            elapsed = time.time() - t0
+            ok = proc.returncode == 0
+            print(f"  [{test_type}] {'PASS' if ok else 'FAIL'} in {elapsed:.0f}s")
+            if not ok:
+                # Dump last 20 lines of make output to help diagnose
+                lines = proc.stdout.splitlines()
+                for ln in lines[-20:]:
+                    print(f"    {ln}")
+        except subprocess.TimeoutExpired:
+            print(f"  [{test_type}] TIMEOUT after {self._TIMEOUT_S}s")
+            return seed, np.zeros(self.n_blocks)
+
+        cov_vec = self._extract_coverage(test_type, seed)
+        self.type_obs[test_type].append(cov_vec)
+        return seed, cov_vec
+
+    def _extract_coverage(self, test_type, seed):
+        """Extract per-test branch coverage from the VDB for test_type/seed."""
+        test_name = f"test_{test_type}_{seed}"
+
+        # Locate the test's data path inside the VDB
+        avail = subprocess.run(
+            ['urg', '-dir', self.vdb_path, '-show', 'availabletests'],
+            capture_output=True, text=True).stdout
+        test_path = next(
+            (ln.strip() for ln in avail.splitlines()
+             if os.path.basename(ln.strip()) == test_name),
+            None)
+        if test_path is None:
+            print(f"  WARNING: {test_name} not in VDB — cosim failure or "
+                  "coverage not written")
+            return np.zeros(self.n_blocks)
+
+        with tempfile.TemporaryDirectory() as td:
+            tl   = os.path.join(td, 'tests.list')
+            rdir = os.path.join(td, 'report')
+            with open(tl, 'w') as f:
+                f.write(test_path + '\n')
+            subprocess.run(
+                ['urg', '-dir', self.vdb_path, '-tests', tl,
+                 '-format', 'text', '-report', rdir, '-log', '/dev/null'],
+                capture_output=True)
+            modinfo = os.path.join(rdir, 'modinfo.txt')
+            if not os.path.exists(modinfo):
+                return np.zeros(self.n_blocks)
+            blocks = _parse_branch_blocks(modinfo)
+
+        vec = np.zeros(self.n_blocks)
+        for blk, (cov, _) in blocks.items():
+            if blk in self.block_idx:
+                vec[self.block_idx[blk]] = cov
+        return vec
+
+    def expected_gain_per_type(self, current_cov):
+        """
+        Estimate expected marginal gain per test type.
+
+        With a prior: delegate to CoverageOracle (uses all 480 historical seeds —
+        very accurate, no simulations needed for estimation).
+
+        Without a prior: use running means from real simulations so far.
+        Test types not yet run get an optimistic estimate so the bandit explores
+        them before committing.
+        """
+        if self.prior is not None:
+            return self.prior.expected_gain_per_type(current_cov)
+
+        tried_means = [
+            np.mean([self.marginal_gain(current_cov, o) for o in obs])
+            for obs in self.type_obs.values() if obs
+        ]
+        default = (np.mean(tried_means) * 2.0) if tried_means else 0.01
+
+        gains = {}
+        for tt in self.test_types:
+            if self.type_obs[tt]:
+                gains[tt] = np.mean([
+                    self.marginal_gain(current_cov, o)
+                    for o in self.type_obs[tt]
+                ])
+            else:
+                gains[tt] = default
+        return gains
+
+
+# ---------------------------------------------------------------------------
 # Selection strategies
 # ---------------------------------------------------------------------------
 
@@ -252,18 +469,24 @@ class UCBStrategy:
 # Main simulation loop
 # ---------------------------------------------------------------------------
 
-def run_loop(strategy, oracle, n_iters, seed=42):
+def run_loop(strategy, sim, n_iters, seed=42):
+    """
+    Run n_iters iterations of the CDG loop.
+
+    sim can be a CoverageOracle (lookup-table mode) or a RealSimOracle
+    (actual VCS simulation mode) — both expose the same interface.
+    """
     rng = np.random.default_rng(seed)
-    current_cov = np.zeros(oracle.n_blocks)
-    history = []  # (iter, score, test_type_chosen)
+    current_cov = np.zeros(sim.n_blocks)
+    history = []  # (iter, score, test_type_chosen, gain)
 
     for i in range(n_iters):
         test_type = strategy.select(current_cov, rng)
-        _, new_cov = oracle.run_test(test_type, rng)
+        _, new_cov = sim.run_test(test_type, rng)
 
-        gain = oracle.marginal_gain(current_cov, new_cov)
+        gain = sim.marginal_gain(current_cov, new_cov)
         current_cov = np.maximum(current_cov, new_cov)
-        score = oracle._block_score(current_cov)
+        score = sim._block_score(current_cov)
 
         strategy.update(test_type, gain)
         history.append((i + 1, score, test_type, gain))
@@ -355,56 +578,132 @@ def convergence_summary(histories, oracle):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    # ---- data / oracle ----
     parser.add_argument('--build-db', action='store_true',
                         help='Build coverage database from VDB (requires urg)')
-    parser.add_argument('--vdb', default=(
-        '/opt/ibex/dv/uvm/core_ibex/out/run/coverage/shared_cov/test.vdb'),
-        help='Path to merged VDB (for --build-db)')
+    parser.add_argument('--vdb',
+                        default='/opt/ibex/dv/uvm/core_ibex/out/run/coverage/'
+                                'shared_cov/test.vdb',
+                        help='Path to shared_cov VDB (for --build-db)')
     parser.add_argument('--db', default='/tmp/seed_coverage.json',
                         help='Path to coverage database JSON')
+
+    # ---- real simulator ----
+    parser.add_argument('--real', action='store_true',
+                        help='Drive actual VCS simulations instead of oracle lookup')
+    parser.add_argument('--ibex-dir',
+                        default=RealSimOracle._DEFAULT_IBEX,
+                        help='Path to ibex dv directory (contains Makefile)')
+    parser.add_argument('--riscvdv-root',
+                        default=RealSimOracle._DEFAULT_DV,
+                        help='RISCV_DV_ROOT exported to make')
+    parser.add_argument('--pkg-config-path',
+                        default=RealSimOracle._DEFAULT_PKG,
+                        help='PKG_CONFIG_PATH for spike libs; empty to inherit')
+
+    # ---- loop control ----
     parser.add_argument('--iters', type=int, default=60,
-                        help='Number of simulated test iterations per strategy')
+                        help='CDG iterations per strategy')
     parser.add_argument('--strategy', choices=['random', 'greedy', 'ucb', 'all'],
                         default='all', help='Which strategy to run')
     parser.add_argument('--ucb-c', type=float, default=0.5,
                         help='UCB exploration constant (higher = more exploration)')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for reproducibility')
+
     args = parser.parse_args()
 
+    # ------------------------------------------------------------------ build
     if args.build_db:
         build_coverage_db(args.vdb, args.db)
         return
 
-    if not os.path.exists(args.db):
-        print(f"Coverage database not found: {args.db}")
-        print("Run with --build-db first, or point --db at an existing JSON file.")
-        sys.exit(1)
+    # ------------------------------------------------------------------ setup
+    if args.real:
+        # Real mode: must have a block schema (from --db) OR discover from VDB.
+        # We always prefer loading --db as a prior so Greedy can use historical
+        # expected-gain estimates without running extra simulations.
+        if not os.path.exists(args.db):
+            print(f"ERROR: --real requires --db for block layout and test types.\n"
+                  f"Run --build-db first: "
+                  f"python3 coverage_directed_gen.py --build-db --vdb {args.vdb}")
+            sys.exit(1)
 
-    oracle = CoverageOracle(args.db)
-    print(f"Loaded coverage oracle: {len(oracle.seeds)} seeds, "
-          f"{oracle.n_blocks} branch blocks, {len(oracle.test_types)} test types")
-    print(f"Coverage ceiling: {oracle.ceiling_score*100:.2f}%")
+        prior = CoverageOracle(args.db)
+        sim = RealSimOracle(
+            ibex_dir        = args.ibex_dir,
+            riscvdv_root    = args.riscvdv_root,
+            pkg_config_path = args.pkg_config_path,
+            all_blocks      = prior.all_blocks,
+            block_idx       = prior.block_idx,
+            M_tot           = prior.M_tot,
+            test_types      = prior.test_types,
+            prior           = prior,
+        )
+        print(f"Real-sim mode: ibex={args.ibex_dir}")
+        print(f"  RISCV_DV_ROOT={args.riscvdv_root}")
+        print(f"  Prior oracle: {len(prior.seeds)} seeds, "
+              f"{prior.n_blocks} blocks, {len(prior.test_types)} test types")
+        print(f"  Coverage ceiling (from prior): {prior.ceiling_score*100:.2f}%")
+        print(f"  VDB: {sim.vdb_path}")
+        print(f"  Existing seeds excluded: {len(sim._existing_seeds_in_vdb())}")
+    else:
+        if not os.path.exists(args.db):
+            print(f"Coverage database not found: {args.db}")
+            print("Run with --build-db first, or point --db at an existing file.")
+            sys.exit(1)
+        prior = None
+        sim = CoverageOracle(args.db)
+        print(f"Oracle mode: {len(sim.seeds)} seeds, "
+              f"{sim.n_blocks} branch blocks, {len(sim.test_types)} test types")
+        print(f"Coverage ceiling: {sim.ceiling_score*100:.2f}%")
 
+    # ------------------------------------------------------------------ run
     strategies_to_run = []
     if args.strategy in ('random', 'all'):
-        strategies_to_run.append(RandomStrategy(oracle))
+        strategies_to_run.append(RandomStrategy(sim))
     if args.strategy in ('greedy', 'all'):
-        strategies_to_run.append(GreedyStrategy(oracle))
+        strategies_to_run.append(GreedyStrategy(sim))
     if args.strategy in ('ucb', 'all'):
-        strategies_to_run.append(UCBStrategy(oracle, c=args.ucb_c))
+        strategies_to_run.append(UCBStrategy(sim, c=args.ucb_c))
 
     histories = []
     for strat in strategies_to_run:
+        if args.real:
+            # Re-create sim so each strategy starts from the same VDB state.
+            # Share the same prior but each strategy writes to a separate VDB
+            # accumulation by using fresh seeds.
+            sim_s = RealSimOracle(
+                ibex_dir        = args.ibex_dir,
+                riscvdv_root    = args.riscvdv_root,
+                pkg_config_path = args.pkg_config_path,
+                all_blocks      = prior.all_blocks,
+                block_idx       = prior.block_idx,
+                M_tot           = prior.M_tot,
+                test_types      = prior.test_types,
+                prior           = prior,
+            )
+            strat_instance = type(strat)(sim_s) if not isinstance(strat, UCBStrategy) \
+                             else UCBStrategy(sim_s, c=args.ucb_c)
+        else:
+            sim_s = sim
+            strat_instance = strat
+
         print(f"\nRunning {strat.name} strategy ({args.iters} iterations)...")
-        hist, _ = run_loop(strat, oracle, args.iters, seed=args.seed)
+        hist, _ = run_loop(strat_instance, sim_s, args.iters, seed=args.seed)
         histories.append((strat.name, hist))
         final = hist[-1][1]
-        print(f"  Final coverage: {final*100:.2f}% "
-              f"({final/oracle.ceiling_score*100:.1f}% of ceiling)")
+        ceil = sim_s.ceiling_score
+        pct = (final / ceil * 100) if ceil > 0 else 0.0
+        print(f"  Final coverage: {final*100:.2f}%"
+              + (f" ({pct:.1f}% of ceiling)" if ceil > 0 else ""))
 
-    print_results(histories, oracle, args.iters)
-    convergence_summary(histories, oracle)
+    # In real mode, use the prior (CoverageOracle) for display metadata
+    # (seed count, ceiling). The strategies still report real-sim coverage.
+    display_oracle = prior if (args.real and prior is not None) else sim
+    print_results(histories, display_oracle, args.iters)
+    convergence_summary(histories, display_oracle)
 
 
 if __name__ == '__main__':
