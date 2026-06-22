@@ -371,21 +371,33 @@ The ibex RTL has 92.34% reachable branch coverage from its 39 existing test type
 naive 480-test regression reaches that ceiling — but wastes 390 of those tests (81%),
 because 36 of 39 test types are structurally redundant with each other.
 
-CDG finds a near-optimal test sequence without knowing the answer in advance:
+All three CDG strategies were validated with real VCS simulations:
 
-- **13 real VCS simulations** → **91.64% branch coverage** (99.2% of what 480 tests achieve)
-- **3.5 minutes** wall-clock vs hours for the full regression
-- **35× fewer tests** to get essentially the same structural coverage
+| Strategy | Iters | Coverage | % of ceiling | Time    |
+|----------|-------|----------|-------------|---------|
+| Greedy   | 13    | 91.64%   | 99.2%       | ~3.5 min |
+| UCB      | 35    | 91.80%   | 99.4%       | ~10 min  |
+| Random   | 13    | 90.15%   | 97.6%       | ~3.5 min |
+| Regression | 480 | ~92.34% | 100% (ceiling) | hours  |
 
-The Greedy strategy independently discovered the same test types that the leave-one-out
-analysis identified as uniquely valuable — `illegal_instr`, `mem_error`, `mmu_stress` —
-without being told. It also correctly spent no budget on the 7 `ibex_alu` blocks that are
-structurally unreachable by any existing test type.
+**Greedy** reaches 99% of ceiling in 12 iterations — fastest to convergence. It
+independently selected `illegal_instr`, `mem_error`, and `mmu_stress` as the most
+valuable test types, matching the leave-one-out analysis exactly.
 
-The remaining 0.8% gap to ceiling cannot be closed by reweighting existing tests. It
-requires new directed instruction streams targeting specific ALU opcode paths — that is
-the actionable output: CDG tells you exactly where to write new tests and stops wasting
-compute on everything else.
+**UCB** takes 21 iterations to reach 99% but ultimately edges past Greedy (99.4% vs
+99.2% at 35 iterations) because it systematically samples all 39 types before exploiting,
+finding slightly different high-gain combinations. It converged faster than oracle
+simulation predicted (iter 21 vs iter 34) because the 480-seed prior warm-starts its
+exploration estimates, reducing blind sampling.
+
+**Random** stalls at 97.6% in the same 13-iteration budget as Greedy and would need 40+
+iterations to reach 99% — confirming that uninformed selection is roughly 3× less
+efficient.
+
+The remaining 0.8% gap (ceiling minus Greedy's 99.2%) cannot be closed by reweighting
+existing tests. It requires new directed instruction streams targeting specific ALU opcode
+paths — CDG tells you exactly where to write new tests and stops wasting compute on
+everything else.
 
 ### Implementation
 
