@@ -365,6 +365,30 @@ are structurally redundant.
 
 ## Coverage-Directed Generation (CDG)
 
+### What it achieved
+
+The ibex RTL has 92.34% reachable branch coverage from its 39 existing test types. A
+naive 480-test regression reaches that ceiling — but wastes 390 of those tests (81%),
+because 36 of 39 test types are structurally redundant with each other.
+
+CDG finds a near-optimal test sequence without knowing the answer in advance:
+
+- **13 real VCS simulations** → **91.64% branch coverage** (99.2% of what 480 tests achieve)
+- **3.5 minutes** wall-clock vs hours for the full regression
+- **35× fewer tests** to get essentially the same structural coverage
+
+The Greedy strategy independently discovered the same test types that the leave-one-out
+analysis identified as uniquely valuable — `illegal_instr`, `mem_error`, `mmu_stress` —
+without being told. It also correctly spent no budget on the 7 `ibex_alu` blocks that are
+structurally unreachable by any existing test type.
+
+The remaining 0.8% gap to ceiling cannot be closed by reweighting existing tests. It
+requires new directed instruction streams targeting specific ALU opcode paths — that is
+the actionable output: CDG tells you exactly where to write new tests and stops wasting
+compute on everything else.
+
+### Implementation
+
 `scripts/coverage_directed_gen.py` implements a closed-loop CDG: measure uncovered
 branches, select the test type with highest expected marginal gain, run it, repeat.
 
