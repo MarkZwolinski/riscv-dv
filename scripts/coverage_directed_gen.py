@@ -229,6 +229,7 @@ class RealSimOracle:
     _DEFAULT_IBEX   = '/opt/ibex/dv/uvm/core_ibex'
     _DEFAULT_DV     = '/home/mz1/riscv-dv'
     _DEFAULT_PKG    = '/opt/spike-lowrisc/install/lib/pkgconfig'
+    _CDG_OUT        = 'out_cdg'   # dedicated output dir — avoids polluting regression out/
     _SEED_START     = 2_000_000   # fresh seeds stay above existing regression range
     _TIMEOUT_S      = 600         # hard per-test wall-clock cap
 
@@ -253,10 +254,89 @@ class RealSimOracle:
             self.ceiling       = np.zeros(self.n_blocks)
             self.ceiling_score = 0.0
 
-        self.vdb_path   = os.path.join(ibex_dir,
-                                       'out/run/coverage/shared_cov/test.vdb')
+        # CDG uses its own output directory to avoid clobbering the regression
+        # metadata and to keep the VDB separate.  The pre-built TB and instr-gen
+        # binaries are symlinked in so we don't pay the ~10 min recompile cost.
+        self._setup_cdg_outdir()
+
+        self.vdb_path   = os.path.join(ibex_dir, self._CDG_OUT,
+                                       'run/coverage/shared_cov/test.vdb')
         self.type_obs   = defaultdict(list)    # observed cov vectors per type
         self._seed_iter = self._fresh_seeds()
+
+    def _setup_cdg_outdir(self):
+        """
+        Prepare out_cdg/ so make skips recompilation and runs only the sim.
+
+        The ibex build system checks two things before deciding to rebuild:
+          1. A stamp file (metadata/<step>.stamp) — must exist and be newer
+             than all source deps.
+          2. A vars.mk file (build/.<step>.vars.mk) — records which make
+             variables were active; a mismatch forces a clean rebuild.
+
+        We satisfy both by copying the existing binaries and vars files from
+        out/build/ into out_cdg/build/.  Copying (not symlinking) the
+        directories avoids the "Cannot rmtree a symlink" error that
+        build_instr_gen.py raises when it tries to clean a symlinked dir.
+        """
+        import shutil
+
+        src_build  = os.path.join(self.ibex_dir, 'out/build')
+        src_meta   = os.path.join(self.ibex_dir, 'out/metadata')
+        out        = os.path.join(self.ibex_dir, self._CDG_OUT)
+        dst_build  = os.path.join(out, 'build')
+        dst_meta   = os.path.join(out, 'metadata')
+
+        os.makedirs(dst_meta, exist_ok=True)
+        os.makedirs(dst_build, exist_ok=True)
+
+        # ---- copy compiled build trees (tb/ and instr_gen/) ----
+        # We copy files and symlink subdirectories.  Copying the top-level dir
+        # avoids the "Cannot rmtree a symlink" error that build_instr_gen.py
+        # raises if the whole dir is a symlink.  The subdirs (e.g. vcs_simv.csrc/
+        # containing VCS shared libs, and asm_test/) are read-only at runtime so
+        # symlinking them is safe.
+        for subdir in ('tb', 'instr_gen'):
+            dst_dir = os.path.join(dst_build, subdir)
+            src_dir = os.path.join(src_build, subdir)
+            if not os.path.exists(dst_dir) and os.path.isdir(src_dir):
+                os.makedirs(dst_dir, exist_ok=True)
+                for fname in os.listdir(src_dir):
+                    src_f = os.path.join(src_dir, fname)
+                    dst_f = os.path.join(dst_dir, fname)
+                    if os.path.exists(dst_f):
+                        continue
+                    if os.path.isfile(src_f):
+                        shutil.copy2(src_f, dst_f)
+                    elif os.path.isdir(src_f):
+                        # Subdirectories (vcs_simv.csrc/, asm_test/) are safe
+                        # to symlink — the build system only rmtrees the
+                        # top-level instr_gen/ or tb/ dir, not their children.
+                        os.symlink(src_f, dst_f)
+
+        # ---- copy vars.mk files so make sees the same build config ----
+        for fname in ('.tb.vars.mk', '.instr_gen.vars.mk', '.cc.vars.mk'):
+            src_f = os.path.join(src_build, fname)
+            dst_f = os.path.join(dst_build, fname)
+            if os.path.isfile(src_f) and not os.path.exists(dst_f):
+                shutil.copy2(src_f, dst_f)
+
+        # ---- copy build stamps so make considers those steps done ----
+        for stamp in ('tb.compile.stamp', 'instr.gen.build.stamp',
+                      'core.config.stamp'):
+            src_f = os.path.join(src_meta, stamp)
+            dst_f = os.path.join(dst_meta, stamp)
+            if not os.path.exists(dst_f):
+                if os.path.isfile(src_f):
+                    shutil.copy2(src_f, dst_f)
+                else:
+                    open(dst_f, 'w').close()
+
+        # ---- copy riscv_core_setting.sv produced by core_config step ----
+        cc_src = os.path.join(self.ibex_dir, 'riscv_dv_extension/riscv_core_setting.sv')
+        if os.path.isfile(cc_src):
+            # Already in-place (shared between out/ and out_cdg/ runs)
+            pass
 
     # ------------------------------------------------------------------
     # Seed management
@@ -271,6 +351,7 @@ class RealSimOracle:
             seed += 1
 
     def _existing_seeds_in_vdb(self):
+        # Check the CDG VDB (out_cdg); the regression VDB (out/) is separate
         if not os.path.exists(self.vdb_path):
             return set()
         out = subprocess.run(
@@ -305,9 +386,12 @@ class RealSimOracle:
 
         print(f"  [{test_type}] seed={seed}  running VCS...")
         t0 = time.time()
+        logfile = os.path.join(self.ibex_dir, self._CDG_OUT,
+                               f'cdg_{test_type}_{seed}.log')
         try:
             proc = subprocess.run(
                 ['make', '--no-print-directory',
+                 f'OUT={self._CDG_OUT}',          # isolated output dir
                  'SIMULATOR=vcs', 'ISS=spike', 'IBEX_CONFIG=small',
                  'COV=1', 'GOAL=all',
                  f'TEST={test_type}', f'SEED={seed}', 'ITERATIONS=1'],
@@ -317,8 +401,10 @@ class RealSimOracle:
             elapsed = time.time() - t0
             ok = proc.returncode == 0
             print(f"  [{test_type}] {'PASS' if ok else 'FAIL'} in {elapsed:.0f}s")
+            # Always save the log for post-mortem inspection
+            with open(logfile, 'w') as f:
+                f.write(proc.stdout)
             if not ok:
-                # Dump last 20 lines of make output to help diagnose
                 lines = proc.stdout.splitlines()
                 for ln in lines[-20:]:
                     print(f"    {ln}")
