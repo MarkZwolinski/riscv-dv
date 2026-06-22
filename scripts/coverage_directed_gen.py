@@ -380,10 +380,32 @@ class RealSimOracle:
         merged = np.maximum(current_cov, new_cov_vec)
         return self._block_score(merged) - self._block_score(current_cov)
 
+    def _reset_metadata(self):
+        """Delete per-run metadata files so make regenerates them for the next test.
+
+        Keeps the build stamps (tb.compile.stamp, instr.gen.build.stamp,
+        core.config.stamp) to avoid recompiling the TB/instr_gen.  Deletes
+        everything else: metadata.yaml, metadata.pickle, per-test pickles, and
+        post-sim stamps (merge.cov.stamp, regr.log.stamp, fcov.stamp).
+        """
+        keep = {'tb.compile.stamp', 'instr.gen.build.stamp', 'core.config.stamp'}
+        meta_dir = os.path.join(self.ibex_dir, self._CDG_OUT, 'metadata')
+        if not os.path.isdir(meta_dir):
+            return
+        for fname in os.listdir(meta_dir):
+            if fname not in keep:
+                try:
+                    os.remove(os.path.join(meta_dir, fname))
+                except OSError:
+                    pass
+
     def run_test(self, test_type, rng):
         """Run one seed of test_type through VCS and return (seed, cov_vec)."""
         seed = next(self._seed_iter)
         self.seeds.append(f"test_{test_type}_{seed}")
+
+        # Remove stale metadata so make regenerates create_metadata for this test/seed.
+        self._reset_metadata()
 
         env = {**os.environ, 'RISCV_DV_ROOT': self.riscvdv_root}
         if self.pkg_config_path:
