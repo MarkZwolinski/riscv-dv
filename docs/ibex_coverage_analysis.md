@@ -201,42 +201,61 @@ Iterations to reach fraction of coverage ceiling (oracle):
 | 95%    | 19     | **2**  | 10  |
 | 99%    | >60    | **13** | 34  |
 
-### Results: real VCS simulation (13 iterations, Greedy, `--real` mode)
+### Results: real VCS simulation (all three strategies)
 
-Running `python3 scripts/coverage_directed_gen.py --real --db seed_coverage.json --strategy greedy --iters 13`
-with the ibex make flow (`SIMULATOR=vcs ISS=spike IBEX_CONFIG=small COV=1`):
+All three strategies were run with real VCS simulations using the ibex make flow
+(`SIMULATOR=vcs ISS=spike IBEX_CONFIG=small COV=1 GOAL=check_logs`). Each strategy
+started from a fresh TB compile and empty VDB. Coverage ceiling: **92.34%**.
 
-| Iter | Coverage | % of ceiling |
-|------|----------|-------------|
-| 1    | 86.04%   | 93.2% |
-| 5    | 89.90%   | 97.4% |
-| 10   | 91.16%   | 98.7% |
-| 13   | **91.64%** | **99.2%** |
+#### Coverage progression
 
-Wall-clock: ~44s for iter 1 (TB compiled fresh in `out_cdg/`), 2–22s for subsequent
-iterations (TB reused). Total for 13 iterations: ~3.5 minutes.
+| Iter | Random | Greedy | UCB |
+|------|--------|--------|-----|
+| 1    | 83.24% | **86.04%** | 82.17% |
+| 5    | 87.01% | **89.90%** | 88.82% |
+| 10   | 89.41% | **91.16%** | 89.43% |
+| 13   | 90.15% | **91.64%** | — |
+| 20   | —      | —          | 91.22% |
+| 35   | —      | —          | **91.80%** |
 
-Test types selected by Greedy from real simulations:
+#### Iterations to reach fraction of coverage ceiling (real VCS)
 
-| Test type | Count | Why selected |
-|-----------|-------|-------------|
-| `mem_error` | 3× | Highest expected gain per prior; hits load/store error paths |
-| `illegal_instr` | 2× | Only test reaching illegal-instruction exception paths |
-| `mmu_stress` | 2× | Covers misaligned/PMP paths |
-| `debug_instr` | 1× | Trap handler and debug section paths |
-| `debug_single_step` | 1× | Single-step controller paths |
-| `interrupt_wfi` | 1× | WFI and interrupt pending paths |
-| `csr` | 1× | CSR read/write paths |
-| `assorted_traps_interrupts_debug` | 1× | Mixed trap/interrupt coverage |
+| Target | Random | Greedy | UCB |
+|--------|--------|--------|-----|
+| 90%    | 1      | **1**  | 2   |
+| 95%    | 8      | **4**  | 5   |
+| 99%    | >13    | **12** | 21  |
+
+#### Summary
+
+| Strategy | Iters | Final | % of ceiling | Wall-clock |
+|----------|-------|-------|-------------|------------|
+| Greedy   | 13    | 91.64% | 99.2%       | ~3.5 min   |
+| UCB      | 35    | **91.80%** | **99.4%** | ~10 min |
+| Random   | 13    | 90.15% | 97.6%       | ~3.5 min   |
+
+**Greedy** reaches 99% of ceiling fastest (12 iterations, ~3 min). **UCB** eventually
+edges ahead (99.4% at 35 iterations) because it systematically explores all 39 test types
+before exploiting, discovering slightly different high-gain combinations. **Random** gets
+to 97.6% in the same budget as Greedy but stalls — it would need ~40+ iterations to reach
+99%.
+
+UCB converged at iter 21 (faster than the oracle prediction of iter 34) because the prior
+from the 480-seed regression warm-starts its exploration estimates, reducing the blind
+exploration phase.
+
+#### Test types selected by Greedy (13 iterations)
+
+| Test type | Count |
+|-----------|-------|
+| `mem_error` | 3× |
+| `illegal_instr` | 2× |
+| `mmu_stress` | 2× |
+| `debug_instr`, `debug_single_step`, `interrupt_wfi`, `csr`, `assorted_traps_interrupts_debug` | 1× each |
 
 The real-sim Greedy result (99.2% of ceiling in 13 iterations) matches the oracle
 prediction (99% at iteration 13) — confirming that the prior estimated coverage gains
 correctly from pre-collected VDB data.
-
-Greedy is **5× more efficient** than random at closing to 99% of the achievable ceiling.
-UCB is slower to start (must explore all 39 types before exploiting) but would outperform
-greedy in a richer, higher-dimensional parameter space where greedy is susceptible to
-local optima.
 
 ### What Greedy selects (oracle, 100 iterations)
 

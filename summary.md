@@ -410,29 +410,27 @@ Coverage ceiling: **92.34%**
 
 Greedy is **5× more efficient** than random at reaching 99% of the ceiling.
 
-### Real VCS results (13 iterations, Greedy, `--real` mode)
+### Real VCS results (all three strategies)
 
-```bash
-cd /opt/ibex/dv/uvm/core_ibex
-python3 /home/mz1/riscv-dv/scripts/coverage_directed_gen.py \
-    --real --db /tmp/seed_coverage.json --strategy greedy --iters 13
-```
+Each strategy started from a fresh TB compile and empty VDB.
 
-| Iter | Coverage | % of ceiling |
-|------|----------|-------------|
-| 1    | 86.04%   | 93.2% |
-| 5    | 89.90%   | 97.4% |
-| 10   | 91.16%   | 98.7% |
-| 13   | **91.64%** | **99.2%** |
+| Strategy | Iters | Final coverage | % of ceiling | 99% ceiling at |
+|----------|-------|---------------|-------------|----------------|
+| Greedy   | 13    | 91.64%        | 99.2%       | iter 12        |
+| UCB      | 35    | **91.80%**    | **99.4%**   | iter 21        |
+| Random   | 13    | 90.15%        | 97.6%       | >13            |
 
-Wall-clock: ~44s for iter 1 (fresh TB compile in `out_cdg/`), 2–22s for iters 2–13.
-Total for 13 iterations: ~3.5 minutes.
+Greedy reaches 99% of ceiling fastest (12 iterations, ~3 min). UCB edges ahead at 35
+iterations (99.4%) because it systematically samples all 39 test types before exploiting,
+finding slightly different high-gain combinations. Random stalls at 97.6% in the same
+budget — it would need ~40+ iterations to reach 99%.
 
-Test types selected: `mem_error` ×3, `illegal_instr` ×2, `mmu_stress` ×2, plus one each
-of `debug_instr`, `debug_single_step`, `interrupt_wfi`, `csr`, `assorted_traps_interrupts_debug`.
+UCB converged faster than the oracle predicted (iter 21 vs predicted iter 34) because the
+prior from the 480-seed regression warm-starts the exploration estimates.
 
-Real-sim result matches oracle prediction — the prior from the 480-seed regression correctly
-estimated per-type marginal coverage gain.
+Greedy test types selected (13 iters): `mem_error` ×3, `illegal_instr` ×2, `mmu_stress`
+×2, plus one each of `debug_instr`, `debug_single_step`, `interrupt_wfi`, `csr`,
+`assorted_traps_interrupts_debug`.
 
 ### Structural gaps CDG cannot close
 

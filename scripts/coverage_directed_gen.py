@@ -476,8 +476,17 @@ class RealSimOracle:
 
     def run_test(self, test_type, rng):
         """Run one seed of test_type through VCS and return (seed, cov_vec)."""
+        import shutil
         seed = next(self._seed_iter)
         self.seeds.append(f"test_{test_type}_{seed}")
+
+        # Remove the test run directory if it exists from a prior attempt.  Make
+        # treats an existing directory as evidence that gcc_compile already ran and
+        # skips it, leaving the binary path pointing at a now-deleted /tmp dir.
+        test_run_dir = os.path.join(self.ibex_dir, self._CDG_OUT,
+                                    'run/tests', f'{test_type}.{seed}')
+        if os.path.isdir(test_run_dir):
+            shutil.rmtree(test_run_dir)
 
         # Remove stale metadata so make regenerates create_metadata for this test/seed.
         self._reset_metadata()
