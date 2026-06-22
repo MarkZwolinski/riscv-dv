@@ -324,6 +324,100 @@ Coverage databases:
 
 ---
 
+## Ibex RTL Coverage Analysis (VCS + spike, rv32imc `small` config)
+
+Full analysis documented in `docs/ibex_coverage_analysis.md`.
+
+### Setup
+
+ibex cloned to `/opt/ibex/dv/uvm/core_ibex`. The ibex UVM testbench drives
+riscv-dv-generated tests against the ibex RTL with spike cosimulation. Structural
+coverage collected with VCS `-cm line+tgl+branch`.
+
+Three ibex TB bugs were fixed to get a clean baseline:
+
+| Bug | Fix |
+|-----|-----|
+| `core_ibex_tb_top.sv` never wired the `RV32ZC` parameter to `ibex_top_tracing` — every sim used the package default (`RV32ZcaZcbZcmp`), silently enabling `c.mul` for the `small` config | Wired `RV32ZC` parameter through; `small` now uses `RV32Zca` only |
+| `+enable_ibex_fcov=1` in `cov_opts` activated `ibex_fcov_if.sv` which uses `illegal_bins ... default sequence` — every sim aborted at ~200ns | Removed fcov opts; structural coverage only |
+| ibex's `riscv_core_setting.sv` referenced `CPUCTRLSTS` and `SECURESEED` CSRs not in our enum | Added ibex-specific CSRs to `src/riscv_instr_pkg.sv` |
+
+### 480-test regression results
+
+480 tests across 39 test types. Branch coverage: **81.87%** (enhanced) vs 83.07% (baseline).
+Toggle coverage: **61.45%** vs 60.12% (baseline). Net structural coverage: ~equal.
+
+### Redundancy analysis (leave-one-out)
+
+Only 3 of 39 test types provide any unique structural coverage:
+
+| Test type | Coverage drop if removed |
+|-----------|--------------------------|
+| `riscv_illegal_instr_test` | −1.02% |
+| `riscv_arithmetic_basic_test` | −0.05% |
+| `riscv_interrupt_wfi_test` | −0.05% |
+
+**36 of 39 test types (390 of 480 tests) contribute zero unique structural coverage.**
+The entire debug suite, all interrupt variants, CSR stress, loop, jump, and rand tests
+are structurally redundant.
+
+---
+
+## Coverage-Directed Generation (CDG)
+
+`scripts/coverage_directed_gen.py` implements a closed-loop CDG: measure uncovered
+branches, select the test type with highest expected marginal gain, run it, repeat.
+
+Two backends:
+- **Oracle mode** (default): lookup table from pre-collected per-seed VDB data. Runs in seconds. Used for strategy comparison.
+- **Real mode** (`--real`): drives live VCS simulations via `make SIMULATOR=vcs COV=1 GOAL=check_logs TEST=<type> SEED=<seed>` and reads per-test coverage from the shared VDB with `urg -tests`.
+
+Three strategies: **Random** (baseline), **Greedy** (pick highest expected gain), **UCB** (bandit, exploit/explore).
+
+### Oracle results (60 iterations, 39 test types)
+
+Coverage ceiling: **92.34%**
+
+| Target | Random | Greedy | UCB |
+|--------|--------|--------|-----|
+| 90% of ceiling | 2 iters | **1 iter** | 2 iters |
+| 95% of ceiling | 19 iters | **2 iters** | 10 iters |
+| 99% of ceiling | >60 iters | **13 iters** | 34 iters |
+
+Greedy is **5× more efficient** than random at reaching 99% of the ceiling.
+
+### Real VCS results (13 iterations, Greedy, `--real` mode)
+
+```bash
+cd /opt/ibex/dv/uvm/core_ibex
+python3 /home/mz1/riscv-dv/scripts/coverage_directed_gen.py \
+    --real --db /tmp/seed_coverage.json --strategy greedy --iters 13
+```
+
+| Iter | Coverage | % of ceiling |
+|------|----------|-------------|
+| 1    | 86.04%   | 93.2% |
+| 5    | 89.90%   | 97.4% |
+| 10   | 91.16%   | 98.7% |
+| 13   | **91.64%** | **99.2%** |
+
+Wall-clock: ~44s for iter 1 (fresh TB compile in `out_cdg/`), 2–22s for iters 2–13.
+Total for 13 iterations: ~3.5 minutes.
+
+Test types selected: `mem_error` ×3, `illegal_instr` ×2, `mmu_stress` ×2, plus one each
+of `debug_instr`, `debug_single_step`, `interrupt_wfi`, `csr`, `assorted_traps_interrupts_debug`.
+
+Real-sim result matches oracle prediction — the prior from the 480-seed regression correctly
+estimated per-type marginal coverage gain.
+
+### Structural gaps CDG cannot close
+
+Seven `ibex_alu` branch blocks are capped at 25–40% by every test type in the database.
+These require new directed instruction streams targeting specific ALU opcode paths — no
+amount of test-type reweighting reaches them.
+
+---
+
 ## Quick Start
 
 ```bash
