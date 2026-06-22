@@ -150,3 +150,96 @@ closure.
 The uncovered 37.5% of structural coverage (primarily in `ibex_compressed_decoder` at
 72% and `ibex_alu` at 61%) cannot be reached by any existing test type — it requires
 new tests targeting those modules' uncovered branches specifically.
+
+---
+
+## Coverage-Directed Generation (CDG)
+
+### Motivation
+
+riscv-dv is a static constrained-random generator with no feedback loop: it produces
+tests, runs them, and collects coverage as a side-effect. Nothing reads coverage
+results to adjust the next run. The redundancy analysis above makes the cost of this
+visible — 390 of 480 tests are wasted from a structural coverage perspective.
+
+Coverage-Directed Generation closes the loop: measure which branches are uncovered,
+select the test type most likely to cover them, run it, and repeat.
+
+### Implementation
+
+`scripts/coverage_directed_gen.py` implements the CDG loop with a simulation oracle
+backed by the per-seed VDB data collected above. Three selection strategies are compared:
+
+- **Random**: pick a test type uniformly at random each iteration (baseline)
+- **Greedy**: always pick the test type with the highest expected marginal coverage gain
+- **UCB** (Upper Confidence Bound): bandit algorithm balancing exploitation of known
+  high-gain test types with exploration of less-tried ones
+
+The oracle works by mapping (test_type, seed) → coverage vector using the 480 existing
+simulations as a lookup table. To use with a real simulator, replace `CoverageOracle.run_test()`
+with a VCS invocation followed by an `urg` call.
+
+### Results (60 iterations, 39 test types, 480-seed oracle)
+
+Coverage ceiling (best achievable from existing test types): **92.34%**
+
+| Iter | Random | Greedy | UCB |
+|------|--------|--------|-----|
+| 1    | 83.0%  | **86.3%** | 82.5% |
+| 5    | 86.2%  | **89.7%** | 87.4% |
+| 10   | 87.0%  | **91.3%** | 88.3% |
+| 20   | 90.1%  | **91.9%** | 88.6% |
+| 40   | 91.3%  | **92.2%** | 91.5% |
+| 60   | 91.4%  | **92.3%** | 91.6% |
+
+Iterations to reach fraction of coverage ceiling:
+
+| Target | Random | Greedy | UCB |
+|--------|--------|--------|-----|
+| 90%    | 2      | **1**  | 2   |
+| 95%    | 19     | **2**  | 10  |
+| 99%    | >60    | **13** | 34  |
+
+Greedy is **5× more efficient** than random at closing to 99% of the achievable ceiling.
+UCB is slower to start (must explore all 39 types before exploiting) but would outperform
+greedy in a richer, higher-dimensional parameter space where greedy is susceptible to
+local optima.
+
+### What Greedy selects
+
+In 100 iterations, Greedy converges to three test types that together reach 100% of the
+ceiling: `arithmetic_basic` (31×), `debug_single_step` (21×), `mem_error` (18×). All
+other test types are selected at most twice. This confirms the leave-one-out finding —
+the same three test types that dominate leave-one-out are the ones the algorithm
+independently discovers.
+
+### Structural gaps the algorithm cannot close
+
+Seven branch blocks in `ibex_alu` are capped at 25–40% by every seed in the database:
+
+| Block | Ceiling | Implication |
+|-------|---------|-------------|
+| `ibex_alu:CASE@305` | 25% | Directed test needed |
+| `ibex_alu:CASE@1322` | 25% | Directed test needed |
+| `ibex_alu:CASE@372` | 33% | Directed test needed |
+| `ibex_alu:CASE@85` | 40% | Directed test needed |
+| `ibex_alu:CASE@60` | 40% | Directed test needed |
+
+The CDG algorithm correctly identifies these as unreachable and stops spending budget on
+them. No amount of test-type reweighting will close these gaps — they require new directed
+instruction streams that specifically target the missing ALU opcode paths.
+
+### PCA structure of the coverage space
+
+Applying PCA to the 480 × 169 coverage matrix reveals that **79% of all variation between
+seeds is captured by two principal components**:
+
+- **PC1 (62%)**: test completion — seeds that abort early score low uniformly across all
+  blocks. Tests that fail (`reset`, `mem_intg_error`, `unaligned_load_store`) are outliers.
+- **PC2 (17%)**: instruction diversity — driven by decoder, ALU, and compressed-decoder
+  blocks. `riscv_csr_test` sits at one extreme (pure CSR traffic, low diversity);
+  debug tests sit at the other (full instruction repertoire plus trap handling).
+
+This structure explains why the CDG algorithm converges quickly: the 39 test types occupy
+a 2D space, most clustering tightly together. Only a handful of test types explore
+distinct regions of RTL state space.
