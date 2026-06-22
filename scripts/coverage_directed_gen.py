@@ -264,6 +264,62 @@ class RealSimOracle:
         self.type_obs   = defaultdict(list)    # observed cov vectors per type
         self._seed_iter = self._fresh_seeds()
 
+    @staticmethod
+    def _fix_vcs_archive_symlinks(daidir):
+        """Create compatibility symlinks for VCS archive .so files renamed by recompile.
+
+        VCS incremental recompile workflow:
+          - The OLD delta archive (_<oldhash>_archive_1.so) is renamed to
+            _prev_archive_1.so (the "base" archive keeps its name).
+          - A NEW delta archive (_<newhash>_archive_1.so) is created.
+          - The main binary's DT_NEEDED still references the OLD hash name.
+
+        After a recompile, the binary needs _<oldhash>_archive_1.so which no
+        longer exists.  Alias it to the NEW delta (_<newhash>_archive_1.so),
+        which contains the same (or updated) symbols.
+
+        If no recompile has happened, _prev_archive_1.so doesn't exist and
+        there is nothing to fix.
+        """
+        import glob
+        prev = os.path.join(daidir, '_prev_archive_1.so')
+        if not os.path.exists(prev):
+            return  # no incremental recompile happened — nothing to fix
+
+        # All named archives in the daidir (excluding _prev_archive_1.so).
+        # After a recompile there is typically ONE: the new delta.
+        named = {
+            os.path.basename(p)
+            for p in glob.glob(os.path.join(daidir, '_*_archive_1.so'))
+            if os.path.basename(p) != '_prev_archive_1.so'
+        }
+        if not named:
+            return  # nothing to alias to
+
+        # Pick the most recently modified archive as the alias target.
+        newest = max(
+            named,
+            key=lambda n: os.path.getmtime(os.path.join(daidir, n))
+        )
+
+        parent_bin = os.path.join(os.path.dirname(daidir), 'vcs_simv')
+        if not os.path.exists(parent_bin):
+            return
+        try:
+            out = subprocess.run(
+                ['strings', parent_bin],
+                capture_output=True, text=True).stdout
+        except FileNotFoundError:
+            return
+
+        for line in out.splitlines():
+            if (line.endswith('_archive_1.so')
+                    and line not in named
+                    and line != '_prev_archive_1.so'):
+                target = os.path.join(daidir, line)
+                if not os.path.exists(target):
+                    os.symlink(newest, target)
+
     def _setup_cdg_outdir(self):
         """
         Prepare out_cdg/ so make skips recompilation and runs only the sim.
@@ -296,7 +352,13 @@ class RealSimOracle:
         # raises if the whole dir is a symlink.  The subdirs (e.g. vcs_simv.csrc/
         # containing VCS shared libs, and asm_test/) are read-only at runtime so
         # symlinking them is safe.
-        for subdir in ('tb', 'instr_gen'):
+        # tb/ is intentionally NOT copied — the TB binary and its
+        # vcs_simv.daidir/ must be compiled fresh together to guarantee
+        # consistency (incremental VCS recompiles can update the daidir
+        # without relinking the binary, leaving them incompatible).
+        # make compiles the TB once in out_cdg/build/tb/ on the first CDG run
+        # and reuses it for all subsequent iterations.
+        for subdir in ('instr_gen',):
             dst_dir = os.path.join(dst_build, subdir)
             src_dir = os.path.join(src_build, subdir)
             if not os.path.exists(dst_dir) and os.path.isdir(src_dir):
@@ -309,10 +371,17 @@ class RealSimOracle:
                     if os.path.isfile(src_f):
                         shutil.copy2(src_f, dst_f)
                     elif os.path.isdir(src_f):
-                        # Subdirectories (vcs_simv.csrc/, asm_test/) are safe
-                        # to symlink — the build system only rmtrees the
-                        # top-level instr_gen/ or tb/ dir, not their children.
-                        os.symlink(src_f, dst_f)
+                        if fname.endswith('.daidir'):
+                            # VCS simulation archives live in .daidir/.  Copy
+                            # the whole dir; symlinks are added afterward (after
+                            # the loop) because the parent vcs_simv binary must
+                            # already exist to determine which archive names to
+                            # alias.
+                            shutil.copytree(src_f, dst_f)
+                        else:
+                            # Other subdirs (vcs_simv.csrc/, asm_test/) are safe
+                            # to symlink.
+                            os.symlink(src_f, dst_f)
 
         # ---- copy vars.mk files so make sees the same build config ----
         for fname in ('.tb.vars.mk', '.instr_gen.vars.mk', '.cc.vars.mk'):
@@ -325,9 +394,14 @@ class RealSimOracle:
         # make considers a target stale if any prereq is >= as new as the target.
         # We touch the stamps to be 5 seconds in the future so they are always
         # strictly newer than the vars.mk files we just copied.
+        #
+        # NOTE: tb.compile.stamp is intentionally NOT copied here.  The TB
+        # binary and its elaboration database (vcs_simv.daidir/) can be left
+        # inconsistent by a VCS incremental recompile.  Letting make compile
+        # the TB fresh in out_cdg/ costs ~10 min on the first CDG run but
+        # guarantees binary/daidir consistency and a correct VDB.
         future = time.time() + 5
-        for stamp in ('tb.compile.stamp', 'instr.gen.build.stamp',
-                      'core.config.stamp'):
+        for stamp in ('instr.gen.build.stamp', 'core.config.stamp'):
             src_f = os.path.join(src_meta, stamp)
             dst_f = os.path.join(dst_meta, stamp)
             if not os.path.exists(dst_f):
@@ -388,7 +462,8 @@ class RealSimOracle:
         everything else: metadata.yaml, metadata.pickle, per-test pickles, and
         post-sim stamps (merge.cov.stamp, regr.log.stamp, fcov.stamp).
         """
-        keep = {'tb.compile.stamp', 'instr.gen.build.stamp', 'core.config.stamp'}
+        keep = {'tb.compile.stamp', 'instr.gen.build.stamp', 'core.config.stamp',
+                'fcov.stamp'}
         meta_dir = os.path.join(self.ibex_dir, self._CDG_OUT, 'metadata')
         if not os.path.isdir(meta_dir):
             return
