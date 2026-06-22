@@ -321,7 +321,11 @@ class RealSimOracle:
             if os.path.isfile(src_f) and not os.path.exists(dst_f):
                 shutil.copy2(src_f, dst_f)
 
-        # ---- copy build stamps so make considers those steps done ----
+        # ---- copy build stamps and advance their timestamps ----
+        # make considers a target stale if any prereq is >= as new as the target.
+        # We touch the stamps to be 5 seconds in the future so they are always
+        # strictly newer than the vars.mk files we just copied.
+        future = time.time() + 5
         for stamp in ('tb.compile.stamp', 'instr.gen.build.stamp',
                       'core.config.stamp'):
             src_f = os.path.join(src_meta, stamp)
@@ -331,6 +335,7 @@ class RealSimOracle:
                     shutil.copy2(src_f, dst_f)
                 else:
                     open(dst_f, 'w').close()
+                os.utime(dst_f, (future, future))
 
         # ---- copy riscv_core_setting.sv produced by core_config step ----
         cc_src = os.path.join(self.ibex_dir, 'riscv_dv_extension/riscv_core_setting.sv')
@@ -393,7 +398,7 @@ class RealSimOracle:
                 ['make', '--no-print-directory',
                  f'OUT={self._CDG_OUT}',          # isolated output dir
                  'SIMULATOR=vcs', 'ISS=spike', 'IBEX_CONFIG=small',
-                 'COV=1', 'GOAL=all',
+                 'COV=1', 'GOAL=check_logs',      # skip fcov/merge_cov/collect_results
                  f'TEST={test_type}', f'SEED={seed}', 'ITERATIONS=1'],
                 cwd=self.ibex_dir, env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
