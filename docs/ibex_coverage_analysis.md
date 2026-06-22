@@ -176,10 +176,11 @@ backed by the per-seed VDB data collected above. Three selection strategies are 
   high-gain test types with exploration of less-tried ones
 
 The oracle works by mapping (test_type, seed) → coverage vector using the 480 existing
-simulations as a lookup table. To use with a real simulator, replace `CoverageOracle.run_test()`
-with a VCS invocation followed by an `urg` call.
+simulations as a lookup table. `RealSimOracle` replaces the lookup table with live VCS
+simulations via the ibex make flow and reads per-test branch coverage from the shared VDB
+with `urg -tests`.
 
-### Results (60 iterations, 39 test types, 480-seed oracle)
+### Results: oracle simulation (60 iterations, 39 test types, 480-seed lookup table)
 
 Coverage ceiling (best achievable from existing test types): **92.34%**
 
@@ -192,7 +193,7 @@ Coverage ceiling (best achievable from existing test types): **92.34%**
 | 40   | 91.3%  | **92.2%** | 91.5% |
 | 60   | 91.4%  | **92.3%** | 91.6% |
 
-Iterations to reach fraction of coverage ceiling:
+Iterations to reach fraction of coverage ceiling (oracle):
 
 | Target | Random | Greedy | UCB |
 |--------|--------|--------|-----|
@@ -200,15 +201,47 @@ Iterations to reach fraction of coverage ceiling:
 | 95%    | 19     | **2**  | 10  |
 | 99%    | >60    | **13** | 34  |
 
+### Results: real VCS simulation (13 iterations, Greedy, `--real` mode)
+
+Running `python3 scripts/coverage_directed_gen.py --real --db seed_coverage.json --strategy greedy --iters 13`
+with the ibex make flow (`SIMULATOR=vcs ISS=spike IBEX_CONFIG=small COV=1`):
+
+| Iter | Coverage | % of ceiling |
+|------|----------|-------------|
+| 1    | 86.04%   | 93.2% |
+| 5    | 89.90%   | 97.4% |
+| 10   | 91.16%   | 98.7% |
+| 13   | **91.64%** | **99.2%** |
+
+Wall-clock: ~44s for iter 1 (TB compiled fresh in `out_cdg/`), 2–22s for subsequent
+iterations (TB reused). Total for 13 iterations: ~3.5 minutes.
+
+Test types selected by Greedy from real simulations:
+
+| Test type | Count | Why selected |
+|-----------|-------|-------------|
+| `mem_error` | 3× | Highest expected gain per prior; hits load/store error paths |
+| `illegal_instr` | 2× | Only test reaching illegal-instruction exception paths |
+| `mmu_stress` | 2× | Covers misaligned/PMP paths |
+| `debug_instr` | 1× | Trap handler and debug section paths |
+| `debug_single_step` | 1× | Single-step controller paths |
+| `interrupt_wfi` | 1× | WFI and interrupt pending paths |
+| `csr` | 1× | CSR read/write paths |
+| `assorted_traps_interrupts_debug` | 1× | Mixed trap/interrupt coverage |
+
+The real-sim Greedy result (99.2% of ceiling in 13 iterations) matches the oracle
+prediction (99% at iteration 13) — confirming that the prior estimated coverage gains
+correctly from pre-collected VDB data.
+
 Greedy is **5× more efficient** than random at closing to 99% of the achievable ceiling.
 UCB is slower to start (must explore all 39 types before exploiting) but would outperform
 greedy in a richer, higher-dimensional parameter space where greedy is susceptible to
 local optima.
 
-### What Greedy selects
+### What Greedy selects (oracle, 100 iterations)
 
-In 100 iterations, Greedy converges to three test types that together reach 100% of the
-ceiling: `arithmetic_basic` (31×), `debug_single_step` (21×), `mem_error` (18×). All
+In 100 oracle iterations, Greedy converges to three test types that together reach 100% of
+the ceiling: `arithmetic_basic` (31×), `debug_single_step` (21×), `mem_error` (18×). All
 other test types are selected at most twice. This confirms the leave-one-out finding —
 the same three test types that dominate leave-one-out are the ones the algorithm
 independently discovers.
