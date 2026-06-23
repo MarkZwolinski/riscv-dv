@@ -426,11 +426,12 @@ Greedy is **5× more efficient** than random at reaching 99% of the ceiling.
 
 Each strategy started from a fresh TB compile and empty VDB.
 
-| Strategy | Iters | Final coverage | % of ceiling | 99% ceiling at |
-|----------|-------|---------------|-------------|----------------|
-| Greedy   | 13    | 91.64%        | 99.2%       | iter 12        |
-| UCB      | 35    | **91.80%**    | **99.4%**   | iter 21        |
-| Random   | 13    | 90.15%        | 97.6%       | >13            |
+| Strategy   | Iters | Final coverage | % of ceiling | 99% ceiling at |
+|------------|-------|---------------|-------------|----------------|
+| Greedy     | 13    | 91.64%        | 99.2%       | iter 12        |
+| UCB        | 35    | **91.80%**    | **99.4%**   | iter 21        |
+| Random     | 13    | 90.15%        | 97.6%       | >13            |
+| Regression | 480   | ~92.34%       | 100% (ceiling) | n/a         |
 
 Greedy reaches 99% of ceiling fastest (12 iterations, ~3 min). UCB edges ahead at 35
 iterations (99.4%) because it systematically samples all 39 test types before exploiting,
