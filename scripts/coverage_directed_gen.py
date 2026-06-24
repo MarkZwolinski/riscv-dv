@@ -15,6 +15,11 @@ Two backends:
                          with --build-db so the real run can reuse the block
                          layout and expected-gain priors.
 
+  VeeR mode (--veer):    drives VeeR-EL2 Verilator simulations. Generates tests
+                         via riscv-dv VCS generator, compiles with riscv-gcc,
+                         runs through VeeR's Verilator testbench, and extracts
+                         line coverage from Verilator's coverage.dat format.
+
 Three selection strategies:
   Random  — pick a test type uniformly at random
   Greedy  — always pick the type with highest expected marginal gain
@@ -33,12 +38,17 @@ Usage:
 
     # Real mode without a prior (UCB explores on its own):
     python3 coverage_directed_gen.py --real --strategy ucb --iters 20
+
+    # VeeR-EL2 mode (requires VeeR-EL2 setup):
+    python3 coverage_directed_gen.py --veer --strategy greedy --iters 20
 """
 
 import argparse
+import glob
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -582,7 +592,331 @@ class RealSimOracle:
             np.mean([self.marginal_gain(current_cov, o) for o in obs])
             for obs in self.type_obs.values() if obs
         ]
-        default = (np.mean(tried_means) * 2.0) if tried_means else 0.01
+        floor = 1.0 / max(self.n_blocks, 1)
+        default = max(np.mean(tried_means) * 2.0, floor) if tried_means else floor
+
+        gains = {}
+        for tt in self.test_types:
+            if self.type_obs[tt]:
+                gains[tt] = np.mean([
+                    self.marginal_gain(current_cov, o)
+                    for o in self.type_obs[tt]
+                ])
+            else:
+                gains[tt] = default
+        return gains
+
+
+# ---------------------------------------------------------------------------
+# VeeR-EL2 Verilator oracle
+# ---------------------------------------------------------------------------
+
+def _parse_verilator_dat(dat_path):
+    """Parse a Verilator coverage.dat file (SystemC::Coverage-3 binary format).
+
+    Format per line:
+        C '\x01key1\x02val1\x01key2\x02val2...' <count>
+
+    SOH (\\x01) separates key-value pairs; STX (\\x02) separates key from value.
+    Relevant keys: 'f' = filename, 'l' = lineno, 'page' = type (v_line = line cov).
+
+    Returns a dict mapping 'basename.sv:lineno' → count (int).
+    """
+    _SOH = '\x01'
+    _STX = '\x02'
+    _LINE_RE = re.compile(r"^C '([^']*)'\s+(\d+)")
+
+    points = {}
+    with open(dat_path) as f:
+        for raw in f:
+            m = _LINE_RE.match(raw)
+            if not m:
+                continue
+            payload, count_str = m.group(1), m.group(2)
+            count = int(count_str)
+            # Parse binary key-value pairs
+            kv = {}
+            for pair in payload.split(_SOH):
+                if _STX in pair:
+                    k, v = pair.split(_STX, 1)
+                    kv[k] = v
+            fname  = kv.get('f', '')
+            lineno = kv.get('l', '')
+            if fname and lineno:
+                key = f"{os.path.basename(fname)}:{lineno}"
+                points[key] = max(points.get(key, 0), count)
+    return points
+
+
+class VeerSimOracle:
+    """
+    Coverage oracle that runs VeeR-EL2 Verilator simulations.
+
+    Setup (one-time):
+      1. VeeR-EL2 repository at veer_root with Verilator binary already built:
+         cd <veer_root>/tools/riscv-dv
+         BUILD_PATH=work $RV_ROOT/configs/veer.config ...
+         verilator ... --coverage-line -Mdir work/verilator
+         make -C work/verilator -f Vtb_top.mk OPT_FAST="-O3"
+
+      2. riscv-dv VCS generator compiled for VeeR's custom target:
+         python3 run.py --simulator vcs --custom_target <veer_root>/tools/riscv-dv
+                        --steps gen -o <gen_out_dir>
+         (The first call compiles vcs_simv; subsequent calls reuse it.)
+
+    Per-test flow:
+      run_test() calls:
+        (a) riscv-dv run.py --steps gen      → .S assembly
+        (b) riscv-dv run.py --steps gcc_compile → .o ELF
+        (c) objcopy -O verilog → program.hex; nm -B -n → program.sym
+        (d) Vtb_top --symbols program.sym --mailbox-sym tohost
+              → exec.log + coverage.dat
+        (e) parse coverage.dat → binary coverage vector
+
+    Coverage is accumulated as a boolean vector: each unique
+    'basename:lineno' point is covered if count > 0 in its .dat file.
+    """
+
+    _DEFAULT_VEER      = '/tmp/veer-el2'
+    _DEFAULT_DV        = '/home/mz1/riscv-dv'
+    _DEFAULT_GEN_OUT   = '/tmp/veer_cdg_gen'
+    _DEFAULT_GCC       = 'riscv64-unknown-elf'
+    _SEED_START        = 3_000_000
+    _TIMEOUT_S         = 300
+    _ISA               = 'rv32imc_zicsr_zifencei'
+
+    def __init__(self, veer_root, riscvdv_root, gen_out_dir, gcc_prefix=None,
+                 test_types=None, prior=None):
+        self.veer_root    = veer_root
+        self.riscvdv_root = riscvdv_root
+        self.gen_out_dir  = gen_out_dir
+        self.gcc_prefix   = gcc_prefix or self._DEFAULT_GCC
+        self.prior        = prior
+
+        self.custom_target = os.path.join(veer_root, 'tools', 'riscv-dv')
+        self.vtb_top       = os.path.join(
+            self.custom_target, 'work', 'verilator', 'Vtb_top')
+        self.link_ld       = os.path.join(self.custom_target, 'link.ld')
+        self.vcs_simv      = os.path.join(gen_out_dir, 'vcs_simv')
+
+        if not os.path.exists(self.vtb_top):
+            raise RuntimeError(
+                f"Vtb_top not found at {self.vtb_top}. "
+                "Build it first with verilator --coverage-line.")
+        if not os.path.exists(self.vcs_simv):
+            raise RuntimeError(
+                f"VCS generator binary not found at {self.vcs_simv}. "
+                "Run: python3 run.py --simulator vcs --custom_target ... --steps gen -o <dir>")
+
+        # Discover test types from VeeR testlist if not provided
+        if test_types is None:
+            test_types = self._load_test_types()
+        self.test_types = sorted(test_types)
+
+        # Build coverage schema from a warm-up test
+        print("VeeR oracle: discovering coverage schema (running one warm-up test)...")
+        schema_dat = self._warm_up()
+        all_pts = _parse_verilator_dat(schema_dat)
+        self.all_blocks = sorted(all_pts.keys())
+        self.n_blocks   = len(self.all_blocks)
+        self.block_idx  = {b: i for i, b in enumerate(self.all_blocks)}
+        self.M_tot      = np.ones(self.n_blocks)  # each point worth 1
+        print(f"  Schema: {self.n_blocks} coverage points from {len(self.all_blocks)} lines")
+
+        # Ceiling: filled in after first real run (use 1.0 initially)
+        if prior is not None and hasattr(prior, 'ceiling_score'):
+            self.ceiling_score = prior.ceiling_score
+            self.ceiling       = np.ones(self.n_blocks)
+        else:
+            self.ceiling_score = 1.0
+            self.ceiling       = np.ones(self.n_blocks)
+
+        self.seeds      = []
+        self.type_obs   = defaultdict(list)
+        self._seed_iter = iter(range(self._SEED_START, self._SEED_START + 100_000))
+
+    def _load_test_types(self):
+        """Return curated RV32IMC test types validated to pass on VeeR-EL2."""
+        # Validated: each of these generates successfully with VCS + rv32imc
+        # custom_target and passes on VeeR-EL2 Verilator (TEST_PASSED).
+        # Excluded: riscv_csr_test (gen fails), riscv_rv32im_instr_test (gen fails),
+        #           riscv_amo_test (A extension not in rv32imc), user/supervisor-mode tests.
+        return [
+            'riscv_arithmetic_basic_test',
+            'riscv_rand_instr_test',
+            'riscv_rand_jump_test',
+            'riscv_loop_test',
+            'riscv_illegal_instr_test',
+            'riscv_hint_instr_test',
+            'riscv_ebreak_test',
+            'riscv_unaligned_load_store_test',
+        ]
+
+    @staticmethod
+    def _fixup_write_tohost(asm_path):
+        """Patch write_tohost to write 0xFF (VeeR PASS) instead of gp (HTIF 1=FAIL on VeeR)."""
+        with open(asm_path) as f:
+            asm = f.read()
+        asm = re.sub(
+            r'(write_tohost\s*:\s*\n\s*)sw gp, tohost, t5',
+            r'\1li t5, 0xff\n                  la gp, tohost\n                  sw t5, 0(gp)',
+            asm
+        )
+        with open(asm_path, 'w') as f:
+            f.write(asm)
+
+    def _warm_up(self):
+        """Run a trivial test to get the full coverage.dat schema."""
+        dat = self._run_single('riscv_arithmetic_basic_test', 9_999_999,
+                               capture_log=False)
+        if dat is None:
+            raise RuntimeError("Warm-up test failed — cannot build coverage schema")
+        return dat
+
+    def _run_single(self, test_type, seed, capture_log=True):
+        """
+        Run one test through the full VeeR pipeline.
+        Returns path to coverage.dat, or None on failure.
+        """
+        td = tempfile.mkdtemp(prefix=f'/tmp/veer_cdg_{seed}_')
+        try:
+            return self._run_in(td, test_type, seed, capture_log)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def _run_in(self, td, test_type, seed, capture_log):
+        """Run test in td; return path to a copy of coverage.dat or None."""
+        # Symlink pre-built VCS generator binary
+        os.symlink(self.vcs_simv, os.path.join(td, 'vcs_simv'))
+        daidir_src = self.vcs_simv + '.daidir'
+        if os.path.isdir(daidir_src):
+            os.symlink(daidir_src, os.path.join(td, 'vcs_simv.daidir'))
+
+        run_args = [
+            'python3', os.path.join(self.riscvdv_root, 'run.py'),
+            '--simulator', 'vcs',
+            '--test', test_type,
+            '--start_seed', str(seed),
+            '--iterations', '1',
+            '--isa', self._ISA,
+            '--mabi', 'ilp32',
+            '--custom_target', self.custom_target,
+            '--testlist', os.path.join(self.custom_target, 'testlist.yaml'),
+            '-o', td,
+        ]
+        cap = subprocess.PIPE if capture_log else None
+
+        # Gen step
+        r = subprocess.run(run_args + ['--steps', 'gen'],
+                           capture_output=capture_log, text=True,
+                           timeout=self._TIMEOUT_S)
+        if r.returncode != 0:
+            return None
+
+        # VeeR-specific assembly fixup:
+        # riscv-dv writes gp (=1 by HTIF convention) to tohost, but VeeR's
+        # testbench interprets 0x01 as TEST_FAILED and 0xFF as TEST_PASSED.
+        # Patch each generated .S to write 0xFF instead.
+        for sf in glob.glob(os.path.join(td, 'asm_test', '*.S')):
+            self._fixup_write_tohost(sf)
+
+        # GCC compile: call directly with VeeR's link.ld so that tohost lands
+        # in the AHB-accessible range (0xD0580000) where the testbench mailbox
+        # can detect writes.  run.py --steps gcc_compile always uses the
+        # repo-default scripts/link.ld which puts .data after text (~0x8000a000).
+        asm_files = glob.glob(os.path.join(td, 'asm_test', '*.S'))
+        if not asm_files:
+            return None
+        gcc = f'{self.gcc_prefix}-gcc'
+        elf = asm_files[0].replace('.S', '.o')
+        r = subprocess.run(
+            [gcc, f'-march={self._ISA}', '-mabi=ilp32',
+             f'-T{self.link_ld}', '-nostartfiles', '-nostdlib',
+             '-I', os.path.join(self.riscvdv_root, 'user_extension'),
+             '-o', elf] + asm_files,
+            capture_output=capture_log, text=True, timeout=self._TIMEOUT_S)
+        if r.returncode != 0:
+            return None
+
+        # Create hex + sym
+        sim_dir = os.path.join(td, 'hdl_sim')
+        os.makedirs(sim_dir, exist_ok=True)
+        hex_path = os.path.join(sim_dir, 'program.hex')
+        sym_path = os.path.join(sim_dir, 'program.sym')
+        r = subprocess.run([f'{self.gcc_prefix}-objcopy', '-O', 'verilog',
+                            elf, hex_path], capture_output=True)
+        if r.returncode != 0:
+            return None
+        with open(sym_path, 'w') as f:
+            subprocess.run([f'{self.gcc_prefix}-nm', '-B', '-n', elf], stdout=f)
+
+        # Run Verilator sim
+        # No --mailbox-sym needed: link.ld places tohost at 0xD0580000 which
+        # matches the testbench's default mem_mailbox address.
+        r = subprocess.run(
+            [self.vtb_top],
+            cwd=sim_dir, capture_output=True, timeout=self._TIMEOUT_S)
+        # Vtb_top returns non-zero for test errors (cosim issues) but still
+        # writes coverage — don't fail on returncode here.
+
+        dat_src = os.path.join(sim_dir, 'coverage.dat')
+        if not os.path.exists(dat_src):
+            return None
+
+        # Copy .dat so we can read it after td cleanup
+        dat_dst = tempfile.mktemp(suffix='.dat', prefix='/tmp/veer_cov_')
+        shutil.copy2(dat_src, dat_dst)
+        return dat_dst
+
+    def _dat_to_vec(self, dat_path):
+        """Parse coverage.dat and return a binary numpy coverage vector."""
+        try:
+            pts = _parse_verilator_dat(dat_path)
+        finally:
+            os.unlink(dat_path)
+        vec = np.zeros(self.n_blocks)
+        for key, count in pts.items():
+            if key in self.block_idx and count > 0:
+                vec[self.block_idx[key]] = 1.0
+        return vec
+
+    def _block_score(self, cov_vec):
+        """Fraction of unique coverage points reached."""
+        return float(cov_vec.mean())
+
+    def marginal_gain(self, current_cov, new_cov_vec):
+        merged = np.maximum(current_cov, new_cov_vec)
+        return self._block_score(merged) - self._block_score(current_cov)
+
+    def run_test(self, test_type, rng):
+        """Run one seed of test_type; return (seed, cov_vec)."""
+        seed = next(self._seed_iter)
+        self.seeds.append(f"test_{test_type}_{seed}")
+        print(f"  [{test_type}] seed={seed}  running Verilator...")
+        t0 = time.time()
+        dat_path = self._run_single(test_type, seed, capture_log=True)
+        elapsed = time.time() - t0
+        if dat_path is None:
+            print(f"  [{test_type}] FAIL in {elapsed:.0f}s")
+            return seed, np.zeros(self.n_blocks)
+        print(f"  [{test_type}] done in {elapsed:.0f}s")
+        cov_vec = self._dat_to_vec(dat_path)
+        self.type_obs[test_type].append(cov_vec)
+        return seed, cov_vec
+
+    def expected_gain_per_type(self, current_cov):
+        """Estimate expected marginal gain per test type."""
+        if self.prior is not None:
+            return self.prior.expected_gain_per_type(current_cov)
+
+        tried_means = [
+            np.mean([self.marginal_gain(current_cov, o) for o in obs])
+            for obs in self.type_obs.values() if obs
+        ]
+        # Floor at 1/n_blocks so untried types always have a positive prior even
+        # when the only tried type is fully saturated (mean=0 → 0*2=0 without floor).
+        floor = 1.0 / max(self.n_blocks, 1)
+        default = max(np.mean(tried_means) * 2.0, floor) if tried_means else floor
 
         gains = {}
         for tt in self.test_types:
@@ -622,7 +956,10 @@ class GreedyStrategy:
 
     def select(self, current_cov, rng):
         gains = self.oracle.expected_gain_per_type(current_cov)
-        return max(gains, key=gains.get)
+        best = max(gains.values())
+        # Break ties randomly so alphabetical order doesn't bias selection.
+        candidates = [tt for tt, g in gains.items() if g >= best - 1e-12]
+        return rng.choice(candidates)
 
     def update(self, test_type, gain):
         pass
@@ -736,17 +1073,21 @@ def print_results(histories, oracle, n_iters):
         note = "structural gap — directed test needed" if cf < 0.5 else ""
         print(f"  {blk:<55}  {cf*100:>7.1f}%  {note}")
 
-    # Test type selection frequency for UCB
+    # Test type selection frequency and cumulative gain
     print(f"\n{'='*72}")
     for name, hist in histories:
         type_counts = defaultdict(int)
-        for _, _, tt, _ in hist:
+        type_gains = defaultdict(float)
+        for _, _, tt, gain in hist:
             type_counts[tt] += 1
+            type_gains[tt] += gain
         top = sorted(type_counts.items(), key=lambda x: -x[1])[:8]
-        print(f"{name} — most selected test types:")
+        print(f"{name} — most selected test types (count | cumulative gain):")
         for tt, cnt in top:
             short = tt.replace('riscv_', '').replace('_test', '')
-            print(f"  {short:<42}  {cnt:>3}x")
+            g = type_gains[tt]
+            blocks = oracle.n_blocks
+            print(f"  {short:<42}  {cnt:>3}x  {g*100:>6.2f}%  ({g*blocks:.1f} pts)")
         print()
 
 
@@ -786,7 +1127,7 @@ def main():
     parser.add_argument('--db', default='/tmp/seed_coverage.json',
                         help='Path to coverage database JSON')
 
-    # ---- real simulator ----
+    # ---- real simulator (ibex VCS) ----
     parser.add_argument('--real', action='store_true',
                         help='Drive actual VCS simulations instead of oracle lookup')
     parser.add_argument('--ibex-dir',
@@ -795,6 +1136,19 @@ def main():
     parser.add_argument('--riscvdv-root',
                         default=RealSimOracle._DEFAULT_DV,
                         help='RISCV_DV_ROOT exported to make')
+
+    # ---- VeeR-EL2 Verilator ----
+    parser.add_argument('--veer', action='store_true',
+                        help='Drive VeeR-EL2 Verilator simulations')
+    parser.add_argument('--veer-root',
+                        default=VeerSimOracle._DEFAULT_VEER,
+                        help='Path to VeeR-EL2 repo root')
+    parser.add_argument('--veer-gen-out',
+                        default=VeerSimOracle._DEFAULT_GEN_OUT,
+                        help='Output dir with pre-built vcs_simv generator binary')
+    parser.add_argument('--veer-gcc-prefix',
+                        default=VeerSimOracle._DEFAULT_GCC,
+                        help='RISC-V GCC prefix (e.g. riscv64-unknown-elf)')
     parser.add_argument('--pkg-config-path',
                         default=RealSimOracle._DEFAULT_PKG,
                         help='PKG_CONFIG_PATH for spike libs; empty to inherit')
@@ -808,6 +1162,8 @@ def main():
                         help='UCB exploration constant (higher = more exploration)')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for reproducibility')
+    parser.add_argument('--standalone', action='store_true',
+                        help='Run each test type once independently and report standalone coverage')
 
     args = parser.parse_args()
 
@@ -817,7 +1173,21 @@ def main():
         return
 
     # ------------------------------------------------------------------ setup
-    if args.real:
+    if args.veer:
+        prior = None
+        sim = VeerSimOracle(
+            veer_root     = args.veer_root,
+            riscvdv_root  = args.riscvdv_root,
+            gen_out_dir   = args.veer_gen_out,
+            gcc_prefix    = args.veer_gcc_prefix,
+        )
+        print(f"VeeR-EL2 mode: veer={args.veer_root}")
+        print(f"  RISCV_DV_ROOT={args.riscvdv_root}")
+        print(f"  generator binary={sim.vcs_simv}")
+        print(f"  Vtb_top={sim.vtb_top}")
+        print(f"  Test types: {len(sim.test_types)}")
+        print(f"  Coverage points: {sim.n_blocks}")
+    elif args.real:
         # Real mode: must have a block schema (from --db) OR discover from VDB.
         # We always prefer loading --db as a prior so Greedy can use historical
         # expected-gain estimates without running extra simulations.
@@ -856,6 +1226,30 @@ def main():
               f"{sim.n_blocks} branch blocks, {len(sim.test_types)} test types")
         print(f"Coverage ceiling: {sim.ceiling_score*100:.2f}%")
 
+    # ------------------------------------------------------------------ standalone
+    if args.standalone:
+        if not args.veer:
+            print("ERROR: --standalone only supported with --veer")
+            sys.exit(1)
+        print(f"\n{'='*72}")
+        print("Standalone coverage per test type (one run each, fresh oracle)")
+        print(f"{'='*72}")
+        rng = np.random.default_rng(args.seed)
+        results = []
+        for tt in sim.test_types:
+            _, cov = sim.run_test(tt, rng)
+            pts = int(np.sum(cov > 0))
+            pct = pts / sim.n_blocks * 100
+            short = tt.replace('riscv_', '').replace('_test', '')
+            print(f"  {short:<42}  {pts:>4} / {sim.n_blocks}  ({pct:.2f}%)")
+            results.append((tt, pts, pct))
+        print(f"\n  Sorted by coverage:")
+        for tt, pts, pct in sorted(results, key=lambda x: -x[1]):
+            short = tt.replace('riscv_', '').replace('_test', '')
+            print(f"  {short:<42}  {pts:>4} pts  ({pct:.2f}%)")
+        print()
+        return
+
     # ------------------------------------------------------------------ run
     strategies_to_run = []
     if args.strategy in ('random', 'all'):
@@ -867,7 +1261,17 @@ def main():
 
     histories = []
     for strat in strategies_to_run:
-        if args.real:
+        if args.veer:
+            # Re-create oracle so each strategy starts from zero coverage
+            sim_s = VeerSimOracle(
+                veer_root    = args.veer_root,
+                riscvdv_root = args.riscvdv_root,
+                gen_out_dir  = args.veer_gen_out,
+                gcc_prefix   = args.veer_gcc_prefix,
+            )
+            strat_instance = type(strat)(sim_s) if not isinstance(strat, UCBStrategy) \
+                             else UCBStrategy(sim_s, c=args.ucb_c)
+        elif args.real:
             # Re-create sim so each strategy starts from the same VDB state.
             # Share the same prior but each strategy writes to a separate VDB
             # accumulation by using fresh seeds.
@@ -896,8 +1300,8 @@ def main():
         print(f"  Final coverage: {final*100:.2f}%"
               + (f" ({pct:.1f}% of ceiling)" if ceil > 0 else ""))
 
-    # In real mode, use the prior (CoverageOracle) for display metadata
-    # (seed count, ceiling). The strategies still report real-sim coverage.
+    # In real mode, use the prior (CoverageOracle) for display metadata.
+    # In VeeR mode, use the last strategy's oracle (which has schema + ceiling).
     display_oracle = prior if (args.real and prior is not None) else sim
     print_results(histories, display_oracle, args.iters)
     convergence_summary(histories, display_oracle)
