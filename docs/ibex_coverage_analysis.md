@@ -110,9 +110,13 @@ paths in the exception arbiter and misaligned memory access tracking.
 
 ## Coverage Redundancy Analysis
 
-A leave-one-out analysis was run: each test type was removed from the full 480-test
-set and the resulting coverage drop measured. Only 3 of 39 test types provide any
-unique structural RTL coverage.
+A leave-one-out analysis was run to find which test types contribute unique coverage.
+For each of the 39 test types, its seeds were removed from the merged VDB and the
+resulting branch coverage re-measured. The drop (full-set coverage minus leave-one-out
+coverage) is the unique contribution of that type — the branches it covers that no
+other test type covers.
+
+Only 3 of 39 test types provide any unique structural RTL coverage.
 
 | Test Type | Seeds | Coverage Drop if Removed | Status |
 |-----------|-------|--------------------------|--------|
@@ -167,18 +171,79 @@ select the test type most likely to cover them, run it, and repeat.
 
 ### Implementation
 
-`scripts/coverage_directed_gen.py` implements the CDG loop with a simulation oracle
-backed by the per-seed VDB data collected above. Three selection strategies are compared:
+`scripts/coverage_directed_gen.py` implements the CDG loop. Three selection strategies
+are compared:
 
 - **Random**: pick a test type uniformly at random each iteration (baseline)
 - **Greedy**: always pick the test type with the highest expected marginal coverage gain
 - **UCB** (Upper Confidence Bound): bandit algorithm balancing exploitation of known
   high-gain test types with exploration of less-tried ones
 
-The oracle works by mapping (test_type, seed) → coverage vector using the 480 existing
-simulations as a lookup table. `RealSimOracle` replaces the lookup table with live VCS
-simulations via the ibex make flow and reads per-test branch coverage from the shared VDB
-with `urg -tests`.
+### Oracle construction
+
+The oracle answers the question: "given what we've covered so far, how many new branch
+blocks will running one seed of test type T likely cover?"
+
+From the 480-test full regression, `urg -tests` extracts a per-seed coverage vector —
+a binary array of length 169 (one entry per RTL branch block) recording which blocks
+that seed hit. These are grouped by test type, giving a lookup table:
+
+```
+test_type → [cov_seed1, cov_seed2, ..., cov_seedN]   # each cov_i is a 169-bit array
+```
+
+At each CDG iteration, the oracle computes **marginal gain** for each test type:
+
+```
+marginal_gain(current_cov, obs) = fraction of blocks in obs not already in current_cov
+expected_gain(T) = mean over all seeds of T of marginal_gain(current_cov, seed)
+```
+
+Test types that have not yet been tried get an optimistic prior:
+`max(mean_of_tried_types × 2.0, 1/n_blocks)`, so the algorithm always has incentive
+to explore them at least once.
+
+`RealSimOracle` replaces the lookup table with live VCS simulations via the ibex make
+flow, reading per-test branch coverage from a shared VDB with `urg -tests` after each
+run. The interface is identical — only the data source changes.
+
+### Greedy algorithm
+
+At each iteration:
+
+1. Compute `expected_gain(T)` for all test types given the cumulative coverage so far.
+2. Pick the type with the highest expected gain (ties broken randomly).
+3. Run one seed of that type.
+4. Merge its coverage into the cumulative set.
+5. Repeat.
+
+Greedy is purely exploitative — it always takes the locally best option. This works
+well when the coverage space is smooth (the best type at step 1 stays the best for
+many subsequent steps) but can get stuck if the oracle's estimates are stale or if
+the first few seeds of the dominant type happen to be low-variance.
+
+### UCB algorithm
+
+UCB treats test type selection as a multi-armed bandit problem. Each test type is an
+"arm"; pulling it yields a reward equal to the marginal coverage gain of one seed.
+The goal is to maximise cumulative coverage, not just exploit the estimated best arm.
+
+The score for test type T at iteration N is:
+
+```
+score(T) = μ_T + c × sqrt(ln(N) / n_T)
+```
+
+where `μ_T` is the mean marginal gain observed so far for T, `n_T` is how many times
+T has been tried, and `c` is an exploration constant. The square-root term grows when
+T is under-sampled relative to the total iteration count, forcing the algorithm to
+revisit neglected types. Types not yet tried at all receive an infinite score and are
+pulled once before exploitation begins.
+
+Compared to Greedy, UCB reaches the same ceiling but takes more iterations because it
+deliberately spends budget on types that turn out to be redundant. The payoff is
+robustness: if the dominant type's estimates are wrong (e.g., due to seed variance),
+UCB self-corrects, whereas Greedy doubles down.
 
 ### Results: oracle simulation (60 iterations, 39 test types, 480-seed lookup table)
 
@@ -283,15 +348,26 @@ instruction streams that specifically target the missing ALU opcode paths.
 
 ### PCA structure of the coverage space
 
-Applying PCA to the 480 × 169 coverage matrix reveals that **79% of all variation between
-seeds is captured by two principal components**:
+PCA was applied to the 480 × 169 binary matrix (rows = individual test seeds, columns =
+RTL branch blocks) to understand how much independent information the 39 test types
+actually carry. Each row is a point in 169-dimensional space; PCA rotates this space to
+find the axes of maximum variance.
 
-- **PC1 (62%)**: test completion — seeds that abort early score low uniformly across all
-  blocks. Tests that fail (`reset`, `mem_intg_error`, `unaligned_load_store`) are outliers.
-- **PC2 (17%)**: instruction diversity — driven by decoder, ALU, and compressed-decoder
-  blocks. `riscv_csr_test` sits at one extreme (pure CSR traffic, low diversity);
-  debug tests sit at the other (full instruction repertoire plus trap handling).
+**79% of all variation between seeds is captured by two principal components:**
 
-This structure explains why the CDG algorithm converges quickly: the 39 test types occupy
-a 2D space, most clustering tightly together. Only a handful of test types explore
-distinct regions of RTL state space.
+- **PC1 (62%)**: test completion. Seeds that abort early (crash, timeout, or cosim
+  mismatch) score near zero on almost every block, pulling them to one end of this axis.
+  Failing test types (`reset`, `mem_intg_error`, `unaligned_load_store`) are outliers
+  along PC1.
+- **PC2 (17%)**: instruction diversity. This axis is driven by blocks in `ibex_decoder`,
+  `ibex_alu`, and `ibex_compressed_decoder`. `riscv_csr_test` sits at one extreme — it
+  generates almost exclusively CSR instructions, leaving most execute-path blocks
+  uncovered. Debug tests sit at the other extreme — they exercise the full instruction
+  repertoire plus trap-handling paths.
+
+The 2D picture explains why CDG converges so quickly: 35 of the 39 test types cluster
+near the same point in PC1–PC2 space (they complete successfully and generate similar
+instruction mixes). Only `illegal_instr`, `arithmetic_basic`, and `interrupt_wfi` occupy
+distinct regions, which is exactly what the leave-one-out analysis independently found.
+More iterations of the same clustered test types add nothing — the CDG algorithm
+discovers this in 13 iterations rather than 480.
