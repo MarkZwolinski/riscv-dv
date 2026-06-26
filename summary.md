@@ -552,6 +552,43 @@ by iteration 10 — more iterations do not help once the ceiling is reached.
 | Structural wall | `ibex_alu` opcode paths | PIC controller + AHB interface |
 | Wall cause | Missing directed tests | Missing interrupt stimulus |
 
+### Why VeeR-EL2's coverage ceiling is lower than ibex's
+
+The 53.73% vs 92.34% gap is not primarily a processor quality difference — three
+compounding factors make a direct comparison misleading:
+
+**1. VeeR's coverage scope includes unreachable peripheral blocks (~46%)**
+
+Verilator's `coverage.dat` measures line coverage across the entire simulation build,
+including the PIC interrupt controller (`pic_map_auto.h`, ~200 blocks) and AHB bus
+interface (`ahb_sif.sv`). These require external interrupt stimulus and AHB transactions
+to exercise — no instruction-only test can reach them. They inflate VeeR's denominator
+without being reachable by any of the 8 test types.
+
+ibex's VCS coverage was scoped to the ibex core RTL. ibex's equivalent interrupt paths
+are inside the core (reachable via `riscv_interrupt_wfi_test`), not in a separate
+peripheral block excluded from measurement.
+
+**2. VeeR had a smaller and less diverse test set (8 vs 39 types)**
+
+The ibex experiment had 39 test types covering interrupts, debug mode, CSR stress, memory
+errors, and MMU — each targeting a distinct processor subsystem. VeeR's CDG was limited
+to 8 basic instruction tests because `riscv_csr_test`, `riscv_rv32im_instr_test`, and
+`riscv_amo_test` fail on VeeR's RV32IMC configuration. The missing test types would cover
+trap handling, CSR register paths, and privilege-mode transitions currently untouched.
+
+**3. Coverage metrics are not comparable (VCS branch vs Verilator line)**
+
+VCS `-cm branch` counts whether each RTL conditional branch was taken and not-taken.
+Verilator line coverage counts whether each source line executed. These measure different
+things at different granularities — comparing 53.73% (Verilator line) with 92.34% (VCS
+branch) directly is not meaningful.
+
+The honest interpretation: ibex's 92.34% ceiling reflects a mature 39-type test suite
+measured against a tightly-scoped core RTL. VeeR's 53.73% ceiling reflects 8 basic
+instruction tests measured against a scope that includes ~300 blocks of peripheral
+infrastructure no instruction-only test can reach.
+
 ---
 
 ## Quick Start
