@@ -495,6 +495,53 @@ amount of test-type reweighting reaches them.
 
 ---
 
+## CDG on VeeR-EL2 (Verilator, RV32IMC)
+
+The CDG experiment was repeated on VeeR-EL2 (ChipsAlliance / Western Digital), an
+RV32IMC in-order core, to test whether strategy rankings transfer across microarchitectures.
+Full details in `docs/ibex_coverage_analysis.md`.
+
+- **Simulator**: Verilator; coverage from `coverage.dat` (644 RTL branch blocks)
+- **Test types**: 8 (RV32IMC subset; `csr`, `rv32im_instr`, `amo` excluded)
+- **Coverage ceiling**: **53.73% (346/644 blocks)** — remaining ~46% in PIC interrupt controller and AHB interface, unreachable without external stimulus
+
+### Standalone coverage per test type (VeeR-EL2)
+
+| Test type | Coverage | Pts |
+|-----------|----------|-----|
+| `illegal_instr` | 53.42% | 344 |
+| `rand_instr` | 53.26% | 343 |
+| `ebreak` / `hint_instr` / `rand_jump` / `unaligned_load_store` | 53.11% | 342 |
+| `loop` | 50.78% | 327 |
+| `arithmetic_basic` | 49.53% | 319 |
+
+All 8 types saturate the same RV32IMC pipeline paths. The highest type covers only 25
+more blocks than the lowest — the space is far flatter than ibex's 39-type space.
+
+### Strategy results (50 iterations, 4 seeds)
+
+| Seed | Random | Greedy | UCB |
+|------|--------|--------|-----|
+| 0    | 53.57% | 53.57% | **53.73%** |
+| 1    | 53.73% | 53.73% | 53.73% |
+| 2    | 53.42% | 53.57% | **53.73%** |
+| 42   | 53.57% | **53.73%** | **53.73%** |
+
+**UCB hits the ceiling in 4/4 seeds. Greedy 3/4. Random 1/4.** All strategies plateau
+by iteration 10 — more iterations do not help once the ceiling is reached.
+
+### Comparison: ibex vs VeeR-EL2
+
+| Aspect | ibex (VCS, 39 types) | VeeR-EL2 (Verilator, 8 types) |
+|--------|----------------------|-------------------------------|
+| Coverage ceiling | 92.34% | 53.73% |
+| Iters to ceiling | ~13 (Greedy) | ~10 (all strategies) |
+| UCB vs Random | UCB wins (99.4% vs 97.6%) | UCB wins (4/4 vs 1/4 seeds) |
+| Structural wall | `ibex_alu` opcode paths | PIC controller + AHB interface |
+| Wall cause | Missing directed tests | Missing interrupt stimulus |
+
+---
+
 ## Quick Start
 
 ```bash
