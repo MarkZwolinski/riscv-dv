@@ -413,3 +413,94 @@ instruction mixes). Only `illegal_instr`, `arithmetic_basic`, and `interrupt_wfi
 distinct regions, which is exactly what the leave-one-out analysis independently found.
 More iterations of the same clustered test types add nothing — the CDG algorithm
 discovers this in 13 iterations rather than 480.
+
+---
+
+## CDG on VeeR-EL2 (Verilator, RV32IMC)
+
+The CDG experiment was repeated on a second processor — VeeR-EL2 (ChipsAlliance /
+Western Digital), an RV32IMC in-order core — to test whether the strategy rankings from
+ibex generalise across different microarchitectures.
+
+### Setup
+
+- **Simulator**: Verilator (`Vtb_top`), driven by the VeeR-EL2 testbench
+- **Coverage**: RTL line coverage from Verilator's `coverage.dat` (644 branch blocks)
+- **Test types**: 8 (the subset of `base_testlist.yaml` that compiles and runs on VeeR's RV32IMC without A-extension)
+- **CDG script**: `scripts/coverage_directed_gen.py --veer`; each iteration generates one test with the VCS SV generator, compiles with `riscv64-unknown-elf-gcc -T link.ld`, and simulates with VeeR's Verilator testbench
+
+Three test types excluded: `riscv_csr_test` and `riscv_rv32im_instr_test` (generator
+fails on VeeR's core settings), `riscv_amo_test` (VeeR RV32IMC has no A extension).
+
+### Standalone coverage per test type
+
+Each test type was run once independently from a clean slate to measure its raw
+contribution:
+
+| Test type | Coverage | Points |
+|-----------|----------|--------|
+| `illegal_instr` | 53.42% | 344 |
+| `rand_instr` | 53.26% | 343 |
+| `ebreak` | 53.11% | 342 |
+| `hint_instr` | 53.11% | 342 |
+| `rand_jump` | 53.11% | 342 |
+| `unaligned_load_store` | 53.11% | 342 |
+| `loop` | 50.78% | 327 |
+| `arithmetic_basic` | 49.53% | 319 |
+
+Coverage is highly overlapping: `arithmetic_basic` alone covers 319/644 blocks (49.5%),
+and the top type adds only 25 blocks over it. Every type above `loop` reaches the same
+~342 blocks via a different instruction mix, all saturating the same instruction-pipeline
+paths.
+
+### Strategy results (50 iterations, 4 seeds)
+
+Coverage ceiling with 8 instruction-only test types: **53.73% (346/644 blocks)**.
+
+| Seed | Random | Greedy | UCB |
+|------|--------|--------|-----|
+| 0    | 53.57% | 53.57% | **53.73%** |
+| 1    | 53.73% | 53.73% | 53.73% |
+| 2    | 53.42% | 53.57% | **53.73%** |
+| 42   | 53.57% | **53.73%** | **53.73%** |
+
+**UCB hits the ceiling in 4/4 seeds. Greedy reaches it in 3/4. Random in 1/4.**
+
+All three strategies plateau well before 50 iterations — the ceiling is reached by
+iteration 10 in most runs. More iterations do not help; the gap between strategies is
+determined by which test types are selected in the first 8–10 iterations.
+
+### Coverage progression (seed 42)
+
+| Iter | Random | Greedy | UCB |
+|------|--------|--------|-----|
+| 1    | 49.53% | 49.53% | 49.53% |
+| 5    | 53.42% | 53.42% | 53.42% |
+| 10   | 53.42% | 53.57% | 53.57% |
+| 20   | 53.57% | 53.57% | 53.57% |
+| 40   | 53.57% | **53.73%** | **53.73%** |
+| 50   | 53.57% | **53.73%** | **53.73%** |
+
+### Structural ceiling
+
+The remaining ~46% of branch blocks (298/644) are in VeeR-EL2's PIC interrupt
+controller (`pic_map_auto.h`) and AHB bus interface (`ahb_sif.sv`). These paths are
+unreachable with instruction-only tests — they require external interrupt stimulus
+delivered to the PIC controller and AHB transactions on the memory bus. No amount of
+test-type reweighting closes this gap.
+
+### Comparison with ibex
+
+| Aspect | ibex (VCS, 39 types) | VeeR-EL2 (Verilator, 8 types) |
+|--------|----------------------|-------------------------------|
+| Coverage ceiling | 92.34% | 53.73% |
+| Iters to ceiling | ~13 (Greedy) | ~10 (all strategies) |
+| UCB vs Random gap | UCB wins (99.4% vs 97.6% of ceiling) | UCB wins (4/4 seeds vs 1/4) |
+| Structural wall | ibex_alu opcode paths | PIC controller + AHB interface |
+| Wall cause | Missing directed tests | Missing interrupt stimulus |
+
+On VeeR-EL2 the coverage space is flatter than ibex: all 8 test types cover essentially
+the same RTL paths (the RV32IMC decode/execute pipeline), so the marginal gain from any
+individual type is small after the first iteration. UCB's advantage over Random comes
+from avoiding the one test type with the lowest standalone coverage (`arithmetic_basic`)
+in later iterations, where Greedy and Random may revisit it unnecessarily.
