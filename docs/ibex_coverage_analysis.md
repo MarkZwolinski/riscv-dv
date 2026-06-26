@@ -424,7 +424,8 @@ ibex generalise across different microarchitectures.
 
 ### Setup
 
-- **Simulator**: Verilator (`Vtb_top`), driven by the VeeR-EL2 testbench
+- **Test generator**: VCS (same SV/UVM generator used for ibex) — produces `.S` assembly
+- **DUT simulator**: Verilator (`Vtb_top`) — VeeR-EL2's own public testbench is Verilator-based; a VCS-based VeeR testbench does not exist in the public repo, so Verilator is the only option for RTL simulation
 - **Coverage**: RTL line coverage from Verilator's `coverage.dat` (644 branch blocks)
 - **Test types**: 8 (the subset of `base_testlist.yaml` that compiles and runs on VeeR's RV32IMC without A-extension)
 - **CDG script**: `scripts/coverage_directed_gen.py --veer`; each iteration generates one test with the VCS SV generator, compiles with `riscv64-unknown-elf-gcc -T link.ld`, and simulates with VeeR's Verilator testbench
