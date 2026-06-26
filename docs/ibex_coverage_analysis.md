@@ -9,6 +9,23 @@ Two runs compared:
 - **Baseline**: `/opt/ibex/vendor/google_riscv-dv` (ibex's vendored riscv-dv)
 - **Enhanced**: `/home/mz1/riscv-dv` (this repository)
 
+```mermaid
+flowchart TD
+    A([Start]) --> B[/"Test list\n(base_testlist.yaml)"/]
+    B --> C["<b>gen</b>\nSV/UVM simulator\ngenerates .S assembly"]
+    C --> D["<b>gcc_compile</b>\nriscv64-unknown-elf-gcc\n.S → ELF"]
+    D --> E["<b>iss_sim</b>\nReference ISS (spike)\nruns ELF → trace CSV"]
+    D --> F["<b>DUT sim</b>\nYour processor\nruns ELF → trace CSV"]
+    E --> G["<b>iss_cmp</b>\nCompare traces\ninstruction by instruction"]
+    F --> G
+    G --> H{Match?}
+    H -->|Yes| I([Pass])
+    H -->|No| J([Mismatch — bug found])
+
+    style J fill:#f88,color:#000
+    style I fill:#8d8,color:#000
+```
+
 ---
 
 ## Bugs Found and Fixed
@@ -178,6 +195,31 @@ are compared:
 - **Greedy**: always pick the test type with the highest expected marginal coverage gain
 - **UCB** (Upper Confidence Bound): bandit algorithm balancing exploitation of known
   high-gain test types with exploration of less-tried ones
+
+```mermaid
+flowchart TD
+    A([Start]) --> B[/"Prior: 480-seed VDB\n(test_type → coverage vectors)"/]
+    B --> C["Build oracle\nexpected_gain per test type"]
+    C --> D{"Select\nnext test type"}
+
+    D -->|Random| E1["Pick uniformly\nat random"]
+    D -->|Greedy| E2["Pick argmax\nexpected_gain(T)"]
+    D -->|UCB| E3["Pick argmax\nμ_T + c·√(ln N / n_T)"]
+
+    E1 --> F["Run one seed\n(VCS sim or oracle lookup)"]
+    E2 --> F
+    E3 --> F
+
+    F --> G["Read branch coverage\n(VDB / coverage vector)"]
+    G --> H["Merge into\ncumulative coverage"]
+    H --> I["Update oracle\nobservations for T"]
+    I --> K{Budget\nexhausted?}
+    K -->|No| D
+    K -->|Yes| L["Report coverage\nvs ceiling"]
+    L --> M([Done])
+
+    style M fill:#8d8,color:#000
+```
 
 ### Oracle construction
 
