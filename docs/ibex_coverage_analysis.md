@@ -432,6 +432,18 @@ ibex generalise across different microarchitectures.
 Three test types excluded: `riscv_csr_test` and `riscv_rv32im_instr_test` (generator
 fails on VeeR's core settings), `riscv_amo_test` (VeeR RV32IMC has no A extension).
 
+```mermaid
+flowchart TD
+    A([CDG iteration start]) --> B{"Strategy\nselects test type T"}
+    B --> C["<b>VCS gen</b>\nSV/UVM simulator\ngenerates .S assembly for T"]
+    C --> D["<b>GCC compile</b>\nriscv64-unknown-elf-gcc\n-T veer/link.ld → ELF"]
+    D --> E["<b>VeeR-EL2 Verilator</b>\nVtb_top runs ELF\n(tohost=0xFF → PASS)"]
+    E --> F["<b>Parse coverage.dat</b>\nSystemC::Coverage-3 binary\n→ 644-bit coverage vector"]
+    F --> G["Merge into\ncumulative coverage"]
+    G --> H["Update oracle\nfor type T"]
+    H --> I([Next iteration])
+```
+
 ### Standalone coverage per test type
 
 Each test type was run once independently from a clean slate to measure its raw

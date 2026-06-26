@@ -505,6 +505,18 @@ Full details in `docs/ibex_coverage_analysis.md`.
 - **Test types**: 8 (RV32IMC subset; `csr`, `rv32im_instr`, `amo` excluded)
 - **Coverage ceiling**: **53.73% (346/644 blocks)** — remaining ~46% in PIC interrupt controller and AHB interface, unreachable without external stimulus
 
+```mermaid
+flowchart TD
+    A([CDG iteration start]) --> B{"Strategy\nselects test type T"}
+    B --> C["<b>VCS gen</b>\nSV/UVM simulator\ngenerates .S assembly for T"]
+    C --> D["<b>GCC compile</b>\nriscv64-unknown-elf-gcc\n-T veer/link.ld → ELF"]
+    D --> E["<b>VeeR-EL2 Verilator</b>\nVtb_top runs ELF\n(tohost=0xFF → PASS)"]
+    E --> F["<b>Parse coverage.dat</b>\nSystemC::Coverage-3 binary\n→ 644-bit coverage vector"]
+    F --> G["Merge into\ncumulative coverage"]
+    G --> H["Update oracle\nfor type T"]
+    H --> I([Next iteration])
+```
+
 ### Standalone coverage per test type (VeeR-EL2)
 
 | Test type | Coverage | Pts |
